@@ -18,7 +18,6 @@ syntax = "proto3";
 
 // [brief]: JET Common Package
 package jnx.jet.common;
-option go_package = "jnx/jet/common";
 
 // [version]: 0.0.0
 import "jnx_common_base_types.proto";

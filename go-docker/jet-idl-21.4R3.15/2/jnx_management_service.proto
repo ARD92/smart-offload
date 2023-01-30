@@ -23,7 +23,6 @@
 syntax = "proto3";
 
 package jnx.jet.management;
-option go_package = "jnx/jet/mgmt";
 
 // [version]: 0.0.0
 import "jnx_common_base_types.proto";

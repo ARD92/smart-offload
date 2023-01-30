@@ -20,8 +20,6 @@ syntax = "proto3";
 
 package jnx.jet.authentication;
 
-option go_package = "jnx/jet/auth";
-
 // [version]: 0.0.0
 import "jnx_common_base_types.proto";
 
