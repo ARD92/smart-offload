@@ -1,12 +1,9 @@
 /*
 Author: Aravind Prabhakar
 Version: v1.0
-Description: Flow offloader using management IPs to inject flowspec redirect to IP action
-
-To do:
-1. use an inmemory db (redis/sqllite3) instead of maintaining a DS
-2. Handle > 1 flow for add and del flows
-
+Description: This jet app listens to syslog messages generated from vSRX. If the flow is active for greater than
+a threshold, it would offload the flow by programming a redirection route on the MX acting as the edge node using 
+pRPD flowspec APIs. This can also be used with various actions. Currently redirect to VRF and action drop is considered. 
 */
 
 package main
@@ -19,9 +16,7 @@ import (
 	"net"
 	"strings"
 	"time"
-	//"gitlab.com/tymonx/go-formatter/formatter"
 	jnx "jnx/jet/common"
-	//mgmt "jnx/jet/mgmt"
 	auth "jnx/jet/auth"
 	rtg "jnx/jet/routing"
 )
@@ -38,7 +33,6 @@ const (
 	JET_USER        = "root"
 	JET_PASSWD      = "juniper123"
 	TIMEOUT         = 30
-	//INDEX = 0
 	ACTION             = "DISCARD" //DISCARD or REDIRECT_TO_VRF
 	REDIRECT_IP        = "10.1.1.1"
 	REDIRECT_COMMUNITY = "target:13979:999"
@@ -52,17 +46,14 @@ type sessionValues struct {
 	source_port string
 	dest_ip     string
 	dest_port   string
-	//protocol string;
 	session_time string
+	//protocol string;
 }
 
 // initiate JET session with junos
 type Session struct {
 	// jetConn holds the gRPC connection made to cRPD
 	jetConn *grpc.ClientConn
-
-	// ribClient is the handle to send gRPC requests JUNOS PRPD RIB service.
-	//cliClient mgmt.ManagementClient
 
 	//pRPD flowspec to handle gRPC
 	bgpClient rtg.BgpClient
@@ -98,26 +89,88 @@ func connectJET(addr string) error {
 	}
 	fmt.Println("connected to grpc")
 	junos.cliContext = metadata.NewOutgoingContext(context.Background(), md)
-	//junos.cliClient = mgmt.NewManagementClient(conn)
 	junos.bgpClient = rtg.NewBgpClient(conn)
 	return nil
 }
 
-//func addFlow(name string, src_ip string, dst_ip string, action string) {
-func addFlow(src_ip string, dst_ip string, action string) {
-	// save name for deleting purposes
-	fmt.Println(src_ip, dst_ip)
+
+// delete a flowspec route from inetflow.0 table 
+func delFlow(src_ip string, dst_ip string, src_port string, dst_port string) {
 	dstIP := &jnx.IpAddress{AddrFormat: &jnx.IpAddress_AddrString{AddrString: dst_ip}}
 	srcIP := &jnx.IpAddress{AddrFormat: &jnx.IpAddress_AddrString{AddrString: src_ip}}
+
+	var srcPortsList []*jnx.NumericRange
+	srcPort := &jnx.NumericRange {min: src_port, max: src_port}
+	srcPorts := &jnx.NumericRangeList {RangeList: srcPortsList}
+
+	var dstPortsList []*jnx.NumericRange
+	dstPort := &jnx.NumericRange {min: dst_port, max:dst_port}
+	dstPorts := &jnx.NumericRangeList {RangeList: dstPortsList}
+
 	// flowspec match conditions
 	flowMatch := &rtg.FlowspecAddress{
 		Destination:     dstIP,
 		DestPrefixLen:   32,
 		Source:          srcIP,
 		SourcePrefixLen: 32,
+		SrcPorts: srcPorts,
+		DestPorts: dstPorts,
 		//IpProtocols:
-		//SrcPorts: srcPorts,
-		//DestPorts: dstPorts,
+	}
+	flowRt := &rtg.RoutePrefix{
+		RoutePrefixAf: &rtg.RoutePrefix_InetFlowspec{InetFlowspec: flowMatch},
+	}
+	// communities defn
+	var communitySlice []*rtg.Community
+	communities := &rtg.Community{Community: COMMUNITY}
+	communitySlice = append(communitySlice, communities)
+	communitySlices := &rtg.Communities{Communities: communitySlice}
+
+	matchRt := &rtg.RouteMatch{
+		DestPrefix:    flowRt,
+		DestPrefixLen: 32,
+		Table:         &rtg.RouteTable{RouteTableFormat: &rtg.RouteTable_Name{Name: &rtg.RouteTableName{Name: "inetflow.0"}}},
+		Protocol:      rtg.RouteProtoType_PROTO_BGP_STATIC,
+		Cookie:        999, //hardcoded
+		Communities:   communitySlices,
+	}
+
+	var matchRtSlice [] *rtg.RouteMatch
+	matchRtSlice = append(matchRtSlice, matchRt)
+	delRequest := rtg.RouteDeleteRequest {OrLonger: false, Routes: matchRtSlice}
+	resp, err := junos.bgpClient.RouteDelete(junos.cliContext, delrequest)
+	if err != nil {
+		fmt.Println("Failed to add flowspec route")
+	} else {
+		fmt.Println("successfully programmed", resp)
+	}
+} 
+
+
+// Add a flowspec route based on received flow with 5 tuple information with redirect-to-vrf or reject action 
+func addFlow(src_ip string, dst_ip string, src_port string, dst_port string, action string) {
+	// save name for deleting purposes
+	fmt.Println(src_ip, dst_ip)
+	dstIP := &jnx.IpAddress{AddrFormat: &jnx.IpAddress_AddrString{AddrString: dst_ip}}
+	srcIP := &jnx.IpAddress{AddrFormat: &jnx.IpAddress_AddrString{AddrString: src_ip}}
+
+	var srcPortsList []*jnx.NumericRange
+	srcPort := &jnx.NumericRange {min: src_port, max: src_port}
+	srcPorts := &jnx.NumericRangeList {RangeList: srcPortsList}
+
+	var dstPortsList []*jnx.NumericRange
+	dstPort := &jnx.NumericRange {min: dst_port, max:dst_port}
+	dstPorts := &jnx.NumericRangeList {RangeList: dstPortsList}
+
+	// flowspec match conditions
+	flowMatch := &rtg.FlowspecAddress{
+		Destination:     dstIP,
+		DestPrefixLen:   32,
+		Source:          srcIP,
+		SourcePrefixLen: 32,
+		SrcPorts: srcPorts,
+		DestPorts: dstPorts,
+		//IpProtocols:
 	}
 	flowRt := &rtg.RoutePrefix{
 		RoutePrefixAf: &rtg.RoutePrefix_InetFlowspec{InetFlowspec: flowMatch},
@@ -173,20 +226,29 @@ func addFlow(src_ip string, dst_ip string, action string) {
 	}
 }
 
+
 // Program valid flows for redirection on MX
-// will check if session table still has flow active
-func programFlow(flow string) {
-	fmt.Println("entering program flow")
-	time.Sleep(VALID_SESS_TIME * time.Second)
-	// check sesstable if exists
-	val, ok := sessTable[flow]
-	if ok {
-		fmt.Println("30 seconds elapsed and flow is still active. adding redirection on MX\n")
-		fmt.Println(val)
-		addFlow(val.source_ip, val.dest_ip, ACTION)
-	} else {
-		fmt.Println("flow doesnt exist. skip programming.. \n")
-	}
+// will check if session table still has flow active. if so, offload
+// if received delete, delete the flow
+// if flow doesnt exist then skip programming
+func programFlow(flow string, action string) {
+	if action == "add" {
+		fmt.Println("entering program flow")
+		time.Sleep(VALID_SESS_TIME * time.Second)
+		// check sesstable if exists
+		val, ok := sessTable[flow]
+		if ok {
+			fmt.Println("30 seconds elapsed and flow is still active. adding redirection on MX\n")
+			fmt.Println(val)
+			addFlow(val.source_ip, val.dest_ip, ACTION)
+			programmedFLowtTable = append(programmedFlowTable, flow)
+		} else {
+			fmt.Println("flow doesnt exist. skip programming.. \n")
+		}
+	} else if action == "del" {
+		fmt.Println("deleting flow")
+		delFlow(val.source_ip, val.dest_ip), val.source_port, val.dest_port)
+	} 
 }
 
 // BGP initialization
@@ -205,9 +267,7 @@ var sessionVals sessionValues
 
 // Map to store {flow1: (sip,dip,sport, dport, protocol, time), flow2:(), flow3:().....}
 var sessTable = make(map[string]sessionValues)
-
-// Store the flowspec name
-var flowspecMap = make(map[string]string)
+var programmedFlowTable []string
 
 func main() {
 	fmt.Println("connected...")
@@ -237,13 +297,14 @@ func main() {
 			sessionVals.dest_port = strings.Split(src_dst[1], "/")[1]
 			sessTable[flow] = sessionVals
 			fmt.Println("added flowinfo to session table\n")
-			go programFlow(flow)
+			go programFlow(flow, add)
 
 		} else if strings.Compare(strings.TrimRight(datasplit[5], " "), SESS_CLOSE) == 0 {
 			flow := datasplit[13]
 			delete(sessTable, flow)
 			fmt.Println("deleted flowinfo from session table\n")
 			// TO do: delete flow entries from MX as well
+			go programFlow(flow, del)
 		}
 		//fmt.Println(sessTable)
 	}
