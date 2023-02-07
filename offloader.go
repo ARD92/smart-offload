@@ -12,46 +12,45 @@ To do:
 package main
 
 import (
+	"context"
 	"fmt"
+	"unicode/utf8"
+	auth "jetoffloader/jnx/jet/auth"
+	jnx "jetoffloader/jnx/jet/common"
+	mgmt "jetoffloader/jnx/jet/mgmt"
 	"net"
 	"strings"
 	"time"
-	"context"
+
+	"gitlab.com/tymonx/go-formatter/formatter"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
-	"gitlab.com/tymonx/go-formatter/formatter"
-	jnx "jetoffloader/jnx/jet/common"
-	mgmt "jetoffloader/jnx/jet/mgmt"
-	auth "jetoffloader/jnx/jet/auth"
 )
 
 const (
-	HOST = "50.1.1.2" //host to bind app to
-	PORT = 514 //port to bind app to
-	TYPE = "udp" //protocol type 
-	SESS_CREATE = "RT_FLOW_SESSION_CREATE:"
-	SESS_CLOSE = "RT_FLOW_SESSION_CLOSE:"
-	VALID_SESS_TIME = 3
-	JET_HOST = "192.167.1.3"
-	JET_PORT = "50051"
-	JET_USER = "root"
-	JET_PASSWD = "juniper123"
-	TIMEOUT = 30
-	REDIRECT_IP = "10.1.1.1"
+	HOST            = "192.171.1.2" //host to bind app to
+	PORT            = 514        //port to bind app to
+	TYPE            = "udp"      //protocol type
+	SESS_CREATE     = "RT_FLOW_SESSION_CREATE"
+	SESS_CLOSE      = "RT_FLOW_SESSION_CLOSE"
+	VALID_SESS_TIME = 5
+	JET_HOST        = "192.167.1.6"
+	JET_PORT        = "50051"
+	JET_USER        = "root"
+	JET_PASSWD      = "juniper123"
+	TIMEOUT         = 30
 	INDEX = 0
 )
 
-
 // session values which would be stored in maps
 type sessionValues struct {
-	source_ip string;
-	source_port string;
-	dest_ip string;
-	dest_port string;
+	source_ip   string
+	source_port string
+	dest_ip     string
+	dest_port   string
 	//protocol string;
-	session_time string;
+	session_time string
 }
-
 
 // initiate JET session with junos
 type Session struct {
@@ -79,13 +78,13 @@ func connectJET(addr string) error {
 	clientId := "traffic-offload"
 	md := metadata.Pairs("client-id", clientId)
 	login := auth.NewAuthenticationClient(conn)
-	loginReq := &auth.LoginRequest {
+	loginReq := &auth.LoginRequest{
 		Username: JET_USER,
 		Password: JET_PASSWD,
 		ClientId: clientId,
 	}
 	junos.cliContext = metadata.NewOutgoingContext(context.Background(), md)
-	if reply, err := login.Login(junos.cliContext, loginReq); err !=nil {
+	if reply, err := login.Login(junos.cliContext, loginReq); err != nil {
 		fmt.Println("Error authenticating..\n")
 	} else if reply.Status.Code != jnx.StatusCode_SUCCESS {
 		fmt.Println("Failed to authenticate\n")
@@ -96,28 +95,40 @@ func connectJET(addr string) error {
 	return nil
 }
 
+// remove UTF-8 character
+func RemoveLastChar(str string) string {
+      for len(str) > 0 {
+              _, size := utf8.DecodeLastRuneInString(str)
+              return str[:len(str)-size]
+      }
+      return str
+}
+
+func RemoveFirstChar(s string) string {
+    _, i := utf8.DecodeRuneInString(s)
+    return s[i:]
+}
+
 // program flow to MX on ephemeral database
-func addFlow(name string, src_ip string, dst_ip string, redirect_ip string) {
-	var configSlice [] *mgmt.EphemeralConfigSetRequest_ConfigOperation
-	xmlTmpl:= `<configuration><routing-options><flow operation='create'><route><name>FLOW_{p}</name><match><source>{p}</source><destination>{p}</destination></match><then><redirect>{p}</redirect></then></route></flow></routing-options></configuration>`
-	//xmlTmplAfter:= `<configuration><routing-options><flow><route insert="after" key="[name={p}]" operation="create"><name>{p}</name><match><destination>{p}</destination><source>{p}</source></match><then><redirect>{p}</redirect></then></route></flow></routing-options></configuration>`
-	xmlConfig, err := formatter.Format(xmlTmpl, name, src_ip, dst_ip, redirect_ip)
-	//fmt.Println(xmlConfig)
-	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation {
-		Id: "offload",
+func addFlow(src_ip string, dst_ip string) {
+	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
+	xmlTmpl := `<configuration><policy-options><prefix-list><name>DEST-PREFIX-OFFLOAD</name><prefix-list-item operation='create'><name>{p}/32</name></prefix-list-item></prefix-list><prefix-list><name>SOURCE-PREFIX-OFFLOAD</name><prefix-list-item operation='create'><name>{p}/32</name></prefix-list-item></prefix-list></policy-options></configuration>`
+	xmlConfig, err := formatter.Format(xmlTmpl,dst_ip,src_ip)
+	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
+		Id:        "offload",
 		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
-		Path: "/",
-		Value: &mgmt.EphemeralConfigSetRequest_ConfigOperation_XmlConfig {
+		Path:      "/",
+		Value: &mgmt.EphemeralConfigSetRequest_ConfigOperation_XmlConfig{
 			XmlConfig: xmlConfig,
 		},
 	}
 	configSlice = append(configSlice, cfgOper)
 
-	output := &mgmt.EphemeralConfigSetRequest {
-		InstanceName: "FLOW_OFFLOAD",
+	output := &mgmt.EphemeralConfigSetRequest{
+		InstanceName:     "FLOW_OFFLOAD",
 		ConfigOperations: configSlice,
-		ValidateConfig: false,
-		LoadOnly: false,
+		ValidateConfig:   false,
+		LoadOnly:         false,
 	}
 	fmt.Println(output)
 	resp, err := junos.cliClient.EphemeralConfigSet(junos.cliContext, output)
@@ -128,72 +139,131 @@ func addFlow(name string, src_ip string, dst_ip string, redirect_ip string) {
 	} else {
 		fmt.Println("successfully programmed", resp)
 	}
-	time.Sleep(30*time.Second)
 }
 
-/*
-func deFlow() {
-	xmlTmpl := `
-	    <configuration>
-            <routing-options>
-                <flow operation="delete"/>
-            </routing-options>
-    </configuration>
-    `
-}
-*/
+// delete flow on MX on ephemeral DB
+func delFlow(src_ip string, dst_ip string) {
+	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
+	xmlTmpl := `<configuration><policy-options><prefix-list><name>DEST-PREFIX-OFFLOAD</name><prefix-list-item operation='delete'><name>{p}</name></prefix-list-item></prefix-list><prefix-list><name>SOURCE-PREFIX-OFFLOAD</name><prefix-list-item operation='delete'><name>{p}</name></prefix-list-item></prefix-list></policy-options></configuration>`
+	xmlConfig, err := formatter.Format(xmlTmpl, dst_ip, src_ip)
+	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
+		Id:        "offload",
+		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
+		Path:      "/",
+		Value: &mgmt.EphemeralConfigSetRequest_ConfigOperation_XmlConfig{
+			XmlConfig: xmlConfig,
+		},
+	}
+	configSlice = append(configSlice, cfgOper)
 
-// Program valid flows for redirection on MX
-// will check if session table still has flow active
-func programFlow(flow string) {
-	time.Sleep(VALID_SESS_TIME*time.Second)
-	// check sesstable if exists 
-	val, ok := sessTable[flow]
-	if ok {
-		fmt.Println("30 seconds elapsed and flow is still active. adding redirection on MX\n")
-		fmt.Println(val)
-		addFlow(val.source_ip, val.dest_ip, REDIRECT_IP)
+	output := &mgmt.EphemeralConfigSetRequest{
+		InstanceName:     "FLOW_OFFLOAD",
+		ConfigOperations: configSlice,
+		ValidateConfig:   false,
+		LoadOnly:         false,
+	}
+	resp, err := junos.cliClient.EphemeralConfigSet(junos.cliContext, output)
+	if err != nil {
+		fmt.Println("Failed to program config in eDB ")
+	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
+		fmt.Println("failed to program config in eDB")
 	} else {
-		fmt.Println("flow doesnt exist. skip programming.. \n")
+		fmt.Println("successfully deleted the flow", resp)
 	}
 }
 
+
 var sessionVals sessionValues
+
 // Map to store {flow1: (sip,dip,sport, dport, protocol, time), flow2:(), flow3:().....}
 var sessTable = make(map[string]sessionValues)
-// Store the flowspec name
-//var flowspecMap = make(map[string]string)
+
+// Parse the flow to grab 5 tuple information
+func parseFlow(buffer string) (sessionValues, string) {
+	datasplit := strings.Split(buffer, " ")
+	sessType := strings.TrimRight(datasplit[5]," ")
+	if strings.Compare(sessType, SESS_CREATE) == 0 {
+		fmt.Println("session create received")
+		sessionVals.session_time = datasplit[1]
+		for i:=7;i<=10; i++ {
+			val := strings.Split(datasplit[i], "=")
+			switch val[0] {
+			case "source-address":
+				sessionVals.source_ip = RemoveFirstChar(RemoveLastChar(val[1]))
+			case "source-port":
+				sessionVals.source_port = val[1]
+			case "destination-address":
+				sessionVals.dest_ip = RemoveFirstChar(RemoveLastChar(val[1]))
+			case "destination-port":
+				sessionVals.dest_port = val[1]
+			}
+		}
+	} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
+		fmt.Println("session close received..")
+		fmt.Println(datasplit)
+		sessionVals.session_time = datasplit[1]
+		for i:=7;i<=10; i++ {
+			val := strings.Split(datasplit[i], "=")
+			switch val[0] {
+			case "source-address":
+				sessionVals.source_ip = RemoveFirstChar(RemoveLastChar(val[1]))
+			case "source-port":
+				sessionVals.source_port = val[1]
+			case "destination-address":
+				sessionVals.dest_ip = RemoveFirstChar(RemoveLastChar(val[1]))
+			case "destination-port":
+				sessionVals.dest_port = val[1]
+			}
+		}
+	}
+	return sessionVals, sessType
+}
+
+//validate flow and offload based on session time threshold
+func programFlow(flow string){
+	time.Sleep(VALID_SESS_TIME * time.Second)
+	val, ok := sessTable[flow]
+	if ok {
+		fmt.Println("30 seconds elapsed and flow is still active. adding redirection on MX\n")
+		addFlow(val.source_ip, val.dest_ip)
+	} else {
+		fmt.Println("flow doesnt exist. skip programming.. \n")
+	}
+	time.Sleep(VALID_SESS_TIME * time.Second * 2)
+	chkAgain, okAgain := sessTable[flow]
+	delete(sessTable, flow)
+	if okAgain {
+		fmt.Println("Flow still active, deleting it..\n")
+		delFlow(chkAgain.source_ip, chkAgain.dest_ip)
+	}
+}
+
 
 func main() {
 	fmt.Println("connected...")
-	serverConn,_ := net.ListenUDP("udp", &net.UDPAddr {IP:[]byte{0,0,0,0}, Port:PORT,Zone:""})
+	serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: []byte{0, 0, 0, 0}, Port: PORT, Zone: ""})
 	buf := make([]byte, 1024)
 	//establish connection to  MX over gRPC channel
-	connectJET(JET_HOST+":"+JET_PORT)
+	connectJET(JET_HOST + ":" + JET_PORT)
 	//receive data from udp socket
 	for {
-		data,_,_ := serverConn.ReadFromUDP(buf)
+		data, _, _ := serverConn.ReadFromUDP(buf)
 		bufdata := string(buf[0:data])
-		datasplit := strings.SplitAfter(bufdata, " ")
-		//sessType := datasplit[5]
-		session_time := datasplit[0]+datasplit[1]+datasplit[2]
-		if strings.Compare(strings.TrimRight(datasplit[5]," "),SESS_CREATE) == 0 {
-			flow := datasplit[11]
-			sessionVals.session_time = session_time
-			src_dst := strings.Split(flow, "->")
-			sessionVals.source_ip = strings.Split(src_dst[0], "/")[0]
-			sessionVals.source_port = strings.Split(src_dst[0],"/")[1]
-			sessionVals.dest_ip = strings.Split(src_dst[1], "/")[0]
-			sessionVals.dest_port = strings.Split(src_dst[1],"/")[1]
-			sessTable[flow] =  sessionVals 
-			fmt.Println("added flowinfo to session table\n")
+		vals, sessType := parseFlow(bufdata)
+		fmt.Println(vals, sessType)
+		if strings.Compare(sessType, SESS_CREATE) == 0 {
+			flow := vals.source_ip +"->"+vals.dest_ip
+			sessTable[flow] = vals
 			go programFlow(flow)
+			fmt.Println("added flowinfo to session table\n")
 
-		} else if strings.Compare(strings.TrimRight(datasplit[5]," "),SESS_CLOSE) == 0 {
-			flow := datasplit[13]
+		} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
+			fmt.Println("deleting flow...")
+			flow := vals.source_ip+"->"+vals.dest_ip
 			delete(sessTable, flow)
 			fmt.Println("deleted flowinfo from session table\n")
 			// TO do: delete flow entries from MX as well
+			go delFlow(vals.source_ip, vals.dest_ip)
 		}
 		//fmt.Println(sessTable)
 	}
