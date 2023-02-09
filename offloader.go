@@ -1,12 +1,9 @@
 /*
 Author: Aravind Prabhakar
 Version: v1.0
-Description: Flow offloader using management IPs to inject flowspec redirect to IP action
-
-To do:
-1. use an inmemory db (redis/sqllite3) instead of maintaining a DS
-2. Handle > 1 flow for add and del flows
-
+Description: Flow offloader on a service chained topology. This app
+will listen to syslog session Inits and closes from vSRX and offload the
+flow on to MX
 */
 
 package main
@@ -14,13 +11,13 @@ package main
 import (
 	"context"
 	"fmt"
-	"unicode/utf8"
 	auth "jetoffloader/jnx/jet/auth"
 	jnx "jetoffloader/jnx/jet/common"
 	mgmt "jetoffloader/jnx/jet/mgmt"
 	"net"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"gitlab.com/tymonx/go-formatter/formatter"
 	"google.golang.org/grpc"
@@ -29,8 +26,8 @@ import (
 
 const (
 	HOST            = "192.171.1.2" //host to bind app to
-	PORT            = 514        //port to bind app to
-	TYPE            = "udp"      //protocol type
+	PORT            = 514           //port to bind app to
+	TYPE            = "udp"         //protocol type
 	SESS_CREATE     = "RT_FLOW_SESSION_CREATE"
 	SESS_CLOSE      = "RT_FLOW_SESSION_CLOSE"
 	VALID_SESS_TIME = 5
@@ -39,7 +36,7 @@ const (
 	JET_USER        = "root"
 	JET_PASSWD      = "juniper123"
 	TIMEOUT         = 30
-	INDEX = 0
+	INDEX           = 0
 )
 
 // session values which would be stored in maps
@@ -75,7 +72,7 @@ func connectJET(addr string) error {
 		fmt.Println("did not connect: %s", err)
 	}
 	junos.jetConn = conn
-	clientId := "traffic-offload"
+	clientId := "trafficoffload"
 	md := metadata.Pairs("client-id", clientId)
 	login := auth.NewAuthenticationClient(conn)
 	loginReq := &auth.LoginRequest{
@@ -97,23 +94,23 @@ func connectJET(addr string) error {
 
 // remove UTF-8 character
 func RemoveLastChar(str string) string {
-      for len(str) > 0 {
-              _, size := utf8.DecodeLastRuneInString(str)
-              return str[:len(str)-size]
-      }
-      return str
+	for len(str) > 0 {
+		_, size := utf8.DecodeLastRuneInString(str)
+		return str[:len(str)-size]
+	}
+	return str
 }
 
 func RemoveFirstChar(s string) string {
-    _, i := utf8.DecodeRuneInString(s)
-    return s[i:]
+	_, i := utf8.DecodeRuneInString(s)
+	return s[i:]
 }
 
 // program flow to MX on ephemeral database
 func addFlow(src_ip string, dst_ip string) {
 	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
 	xmlTmpl := `<configuration><policy-options><prefix-list><name>DEST-PREFIX-OFFLOAD</name><prefix-list-item operation='create'><name>{p}/32</name></prefix-list-item></prefix-list><prefix-list><name>SOURCE-PREFIX-OFFLOAD</name><prefix-list-item operation='create'><name>{p}/32</name></prefix-list-item></prefix-list></policy-options></configuration>`
-	xmlConfig, err := formatter.Format(xmlTmpl,dst_ip,src_ip)
+	xmlConfig, err := formatter.Format(xmlTmpl, dst_ip, src_ip)
 	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
 		Id:        "offload",
 		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
@@ -172,7 +169,6 @@ func delFlow(src_ip string, dst_ip string) {
 	}
 }
 
-
 var sessionVals sessionValues
 
 // Map to store {flow1: (sip,dip,sport, dport, protocol, time), flow2:(), flow3:().....}
@@ -181,11 +177,11 @@ var sessTable = make(map[string]sessionValues)
 // Parse the flow to grab 5 tuple information
 func parseFlow(buffer string) (sessionValues, string) {
 	datasplit := strings.Split(buffer, " ")
-	sessType := strings.TrimRight(datasplit[5]," ")
+	sessType := strings.TrimRight(datasplit[5], " ")
 	if strings.Compare(sessType, SESS_CREATE) == 0 {
 		fmt.Println("session create received")
 		sessionVals.session_time = datasplit[1]
-		for i:=7;i<=10; i++ {
+		for i := 7; i <= 10; i++ {
 			val := strings.Split(datasplit[i], "=")
 			switch val[0] {
 			case "source-address":
@@ -202,7 +198,7 @@ func parseFlow(buffer string) (sessionValues, string) {
 		fmt.Println("session close received..")
 		fmt.Println(datasplit)
 		sessionVals.session_time = datasplit[1]
-		for i:=7;i<=10; i++ {
+		for i := 7; i <= 10; i++ {
 			val := strings.Split(datasplit[i], "=")
 			switch val[0] {
 			case "source-address":
@@ -220,7 +216,7 @@ func parseFlow(buffer string) (sessionValues, string) {
 }
 
 //validate flow and offload based on session time threshold
-func programFlow(flow string){
+func programFlow(flow string) {
 	time.Sleep(VALID_SESS_TIME * time.Second)
 	val, ok := sessTable[flow]
 	if ok {
@@ -229,15 +225,7 @@ func programFlow(flow string){
 	} else {
 		fmt.Println("flow doesnt exist. skip programming.. \n")
 	}
-	time.Sleep(VALID_SESS_TIME * time.Second * 2)
-	chkAgain, okAgain := sessTable[flow]
-	delete(sessTable, flow)
-	if okAgain {
-		fmt.Println("Flow still active, deleting it..\n")
-		delFlow(chkAgain.source_ip, chkAgain.dest_ip)
-	}
 }
-
 
 func main() {
 	fmt.Println("connected...")
@@ -252,14 +240,14 @@ func main() {
 		vals, sessType := parseFlow(bufdata)
 		fmt.Println(vals, sessType)
 		if strings.Compare(sessType, SESS_CREATE) == 0 {
-			flow := vals.source_ip +"->"+vals.dest_ip
+			flow := vals.source_ip + "->" + vals.dest_ip
 			sessTable[flow] = vals
 			go programFlow(flow)
 			fmt.Println("added flowinfo to session table\n")
 
 		} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
 			fmt.Println("deleting flow...")
-			flow := vals.source_ip+"->"+vals.dest_ip
+			flow := vals.source_ip + "->" + vals.dest_ip
 			delete(sessTable, flow)
 			fmt.Println("deleted flowinfo from session table\n")
 			// TO do: delete flow entries from MX as well
