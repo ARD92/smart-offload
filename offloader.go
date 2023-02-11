@@ -18,7 +18,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
+	"crypto/md5"
+	"encoding/hex"
 	"gitlab.com/tymonx/go-formatter/formatter"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
@@ -106,11 +107,18 @@ func RemoveFirstChar(s string) string {
 	return s[i:]
 }
 
+
+//generate Hash. This would be used to create the filter term name
+func HashString(str string) string {
+	hmd5 := md5.Sum([]byte(str))
+	return hex.EncodeToString(hmd5[:])
+}
+
 // program flow to MX on ephemeral database
-func addFlow(src_ip string, dst_ip string) {
+func addFlow(name string, src_ip string, dst_ip string, src_port string, dst_port string) {
 	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
-	xmlTmpl := `<configuration><policy-options><prefix-list><name>DEST-PREFIX-OFFLOAD</name><prefix-list-item operation='create'><name>{p}/32</name></prefix-list-item></prefix-list><prefix-list><name>SOURCE-PREFIX-OFFLOAD</name><prefix-list-item operation='create'><name>{p}/32</name></prefix-list-item></prefix-list></policy-options></configuration>`
-	xmlConfig, err := formatter.Format(xmlTmpl, dst_ip, src_ip)
+	xmlTmpl := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term insert='after' key='[name='OFFLOAD-FIN']' operation='create'><name>OFFLOAD_{p}</name><from><source-address><name>{p}</name></source-address><destination-address><name>{p}</name></destination-address><source-port>{p}</source-port><destination-port>{p}</destination-port></from><then><accept/></then></term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term insert='after' key='[name='OFFLOAD-FIN']' operation='create'><name>OFFLOAD_{p}</name><from><source-address><name>{p}</name></source-address><destination-address><name>{p}</name></destination-address><source-port>{p}</source-port><destination-port>{p}</destination-port></from><then><accept/></then></term></filter>/inet></family></firewall></configuration>`
+	xmlConfig, err := formatter.Format(xmlTmpl, name, src_ip, dst_ip, src_port, dst_port, name, dst_ip, src_ip, dst_port, src_port)
 	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
 		Id:        "offload",
 		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
@@ -139,10 +147,10 @@ func addFlow(src_ip string, dst_ip string) {
 }
 
 // delete flow on MX on ephemeral DB
-func delFlow(src_ip string, dst_ip string) {
+func delFlow(name string) {
 	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
-	xmlTmpl := `<configuration><policy-options><prefix-list><name>DEST-PREFIX-OFFLOAD</name><prefix-list-item operation='delete'><name>{p}</name></prefix-list-item></prefix-list><prefix-list><name>SOURCE-PREFIX-OFFLOAD</name><prefix-list-item operation='delete'><name>{p}</name></prefix-list-item></prefix-list></policy-options></configuration>`
-	xmlConfig, err := formatter.Format(xmlTmpl, dst_ip, src_ip)
+	xmlTmpl := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term operation='delete'><name>OFFLOAD_{p}</name></term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term operation='delete'><name>OFFLOAD_{p}</name></term></filter>/inet></family></firewall></configuration>`
+	xmlConfig, err := formatter.Format(xmlTmpl, name, name)
 	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
 		Id:        "offload",
 		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
@@ -187,11 +195,11 @@ func parseFlow(buffer string) (sessionValues, string) {
 			case "source-address":
 				sessionVals.source_ip = RemoveFirstChar(RemoveLastChar(val[1]))
 			case "source-port":
-				sessionVals.source_port = val[1]
+				sessionVals.source_port = RemoveFirstChar(RemoveLastChar(val[1]))
 			case "destination-address":
 				sessionVals.dest_ip = RemoveFirstChar(RemoveLastChar(val[1]))
 			case "destination-port":
-				sessionVals.dest_port = val[1]
+				sessionVals.dest_port = RemoveFirstChar(RemoveLastChar(val[1]))
 			}
 		}
 	} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
@@ -204,11 +212,11 @@ func parseFlow(buffer string) (sessionValues, string) {
 			case "source-address":
 				sessionVals.source_ip = RemoveFirstChar(RemoveLastChar(val[1]))
 			case "source-port":
-				sessionVals.source_port = val[1]
+				sessionVals.source_port = RemoveFirstChar(RemoveLastChar(val[1]))
 			case "destination-address":
 				sessionVals.dest_ip = RemoveFirstChar(RemoveLastChar(val[1]))
 			case "destination-port":
-				sessionVals.dest_port = val[1]
+				sessionVals.dest_port = RemoveFirstChar(RemoveLastChar(val[1]))
 			}
 		}
 	}
@@ -216,12 +224,12 @@ func parseFlow(buffer string) (sessionValues, string) {
 }
 
 //validate flow and offload based on session time threshold
-func programFlow(flow string) {
+func programFlow(hflow string) {
 	time.Sleep(VALID_SESS_TIME * time.Second)
-	val, ok := sessTable[flow]
+	val, ok := sessTable[hflow]
 	if ok {
 		fmt.Println("30 seconds elapsed and flow is still active. adding redirection on MX\n")
-		addFlow(val.source_ip, val.dest_ip)
+		addFlow(hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
 	} else {
 		fmt.Println("flow doesnt exist. skip programming.. \n")
 	}
@@ -240,18 +248,20 @@ func main() {
 		vals, sessType := parseFlow(bufdata)
 		fmt.Println(vals, sessType)
 		if strings.Compare(sessType, SESS_CREATE) == 0 {
-			flow := vals.source_ip + "->" + vals.dest_ip
-			sessTable[flow] = vals
-			go programFlow(flow)
+			flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
+			hflow := HashString(flow)
+			sessTable[hflow] = vals
+			go programFlow(hflow)
 			fmt.Println("added flowinfo to session table\n")
 
 		} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
 			fmt.Println("deleting flow...")
-			flow := vals.source_ip + "->" + vals.dest_ip
-			delete(sessTable, flow)
+			flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
+			hflow := HashString(flow)
+			delete(sessTable, hflow)
 			fmt.Println("deleted flowinfo from session table\n")
 			// TO do: delete flow entries from MX as well
-			go delFlow(vals.source_ip, vals.dest_ip)
+			go delFlow(hflow)
 		}
 		//fmt.Println(sessTable)
 	}
