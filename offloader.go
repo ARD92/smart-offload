@@ -17,25 +17,25 @@ import (
 	"net"
 	"strings"
 	"time"
+	"log"
+	"syscall"
+	"os"
+	"strconv"
+	"github.com/akamensky/argparse"
 	"unicode/utf8"
-	"crypto/md5"
-	"encoding/hex"
+	"hash/fnv"
 	"gitlab.com/tymonx/go-formatter/formatter"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
+	"golang.org/x/crypto/ssh/terminal"
+
 )
 
 const (
-	HOST            = "192.171.1.2" //host to bind app to
-	PORT            = 514           //port to bind app to
 	TYPE            = "udp"         //protocol type
 	SESS_CREATE     = "RT_FLOW_SESSION_CREATE"
 	SESS_CLOSE      = "RT_FLOW_SESSION_CLOSE"
 	VALID_SESS_TIME = 5
-	JET_HOST        = "192.167.1.6"
-	JET_PORT        = "50051"
-	JET_USER        = "root"
-	JET_PASSWD      = "juniper123"
 	TIMEOUT         = 30
 	INDEX           = 0
 )
@@ -64,7 +64,7 @@ type Session struct {
 
 var junos Session
 
-func connectJET(addr string) error {
+func connectJET(addr string, juser string, jpass string) error {
 	if junos.jetConn != nil {
 		return nil
 	}
@@ -77,8 +77,8 @@ func connectJET(addr string) error {
 	md := metadata.Pairs("client-id", clientId)
 	login := auth.NewAuthenticationClient(conn)
 	loginReq := &auth.LoginRequest{
-		Username: JET_USER,
-		Password: JET_PASSWD,
+		Username: juser,
+		Password: jpass,
 		ClientId: clientId,
 	}
 	junos.cliContext = metadata.NewOutgoingContext(context.Background(), md)
@@ -108,10 +108,12 @@ func RemoveFirstChar(s string) string {
 }
 
 
-//generate Hash. This would be used to create the filter term name
+//generate Hash
 func HashString(str string) string {
-	hmd5 := md5.Sum([]byte(str))
-	return hex.EncodeToString(hmd5[:])
+	h := fnv.New32a()
+	h.Write([]byte(str))
+	s := strconv.FormatUint(uint64(h.Sum32()),10)
+	return s
 }
 
 // program flow to MX on ephemeral database
@@ -236,33 +238,55 @@ func programFlow(hflow string) {
 }
 
 func main() {
-	fmt.Println("connected...")
-	serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: []byte{0, 0, 0, 0}, Port: PORT, Zone: ""})
-	buf := make([]byte, 1024)
-	//establish connection to  MX over gRPC channel
-	connectJET(JET_HOST + ":" + JET_PORT)
-	//receive data from udp socket
-	for {
-		data, _, _ := serverConn.ReadFromUDP(buf)
-		bufdata := string(buf[0:data])
-		vals, sessType := parseFlow(bufdata)
-		fmt.Println(vals, sessType)
-		if strings.Compare(sessType, SESS_CREATE) == 0 {
-			flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
-			hflow := HashString(flow)
-			sessTable[hflow] = vals
-			go programFlow(hflow)
-			fmt.Println("added flowinfo to session table\n")
-
-		} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
-			fmt.Println("deleting flow...")
-			flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
-			hflow := HashString(flow)
-			delete(sessTable, hflow)
-			fmt.Println("deleted flowinfo from session table\n")
-			// TO do: delete flow entries from MX as well
-			go delFlow(hflow)
+	parser := argparse.NewParser("Required-args", "\n============\ntraffic-offloader\n============")
+	fmt.Println("connected to host ...")
+	port := parser.String("p", "port", &argparse.Options{Required: true, Help: "Port number to bind app to"})
+	jip := parser.String("J", "jetip", &argparse.Options{Required: true, Help: "Jet host IP "})
+	jport := parser.String("P", "jetport", &argparse.Options{Required: true, Help: "Jet host port"})
+	//stime := parser.String("s", "sesstime", &argparse.Options{Required: true, Help: "session time to monitor before programming filters"})
+	juser := parser.String("u", "user", &argparse.Options{Required: true, Help: "user name for jet host"})
+	jpass := parser.String("w", "password", &argparse.Options{Required: true, Help: "password for jet host"})
+	err := parser.Parse(os.Args)
+	if err != nil {
+		fmt.Print(parser.Usage(err))
+	} else {
+		if *jpass == "" {
+			log.Print("Enter Password: ")
+			bytePassword, err := terminal.ReadPassword(int(syscall.Stdin))
+			if err != nil {
+				log.Fatalf("Err: %v\n", err)
+			}
+			*jpass = string(bytePassword)
 		}
-		//fmt.Println(sessTable)
+		PORT,_ := strconv.Atoi(*port)
+		//SESSTIME,_ := strconv.Atoi(*stime) 
+		serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: []byte{0, 0, 0, 0}, Port: PORT, Zone: ""})
+		buf := make([]byte, 1024)
+		//establish connection to  MX over gRPC channel
+		connectJET(*jip + ":" + *jport, *juser, *jpass)
+		//receive data from udp socket
+		for {
+			data, _, _ := serverConn.ReadFromUDP(buf)
+			bufdata := string(buf[0:data])
+			vals, sessType := parseFlow(bufdata)
+			fmt.Println(vals, sessType)
+			if strings.Compare(sessType, SESS_CREATE) == 0 {
+				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
+				hflow := HashString(flow)
+				sessTable[hflow] = vals
+				go programFlow(hflow)
+				fmt.Println("added flowinfo to session table\n")
+
+			} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
+				fmt.Println("deleting flow...")
+				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
+				hflow := HashString(flow)
+				delete(sessTable, hflow)
+				fmt.Println("deleted flowinfo from session table\n")
+				// TO do: delete flow entries from MX as well
+				go delFlow(hflow)
+			}
+			//fmt.Println(sessTable)
+		}
 	}
 }
