@@ -13,7 +13,7 @@ import (
 	"fmt"
 	auth "jetoffloader/jnx/jet/auth"
 	jnx "jetoffloader/jnx/jet/common"
-	mgmt "jetoffloader/jnx/jet/mgmt"
+	fw "jetoffloader/jnx/jet/firewall"
 	"net"
 	"strings"
 	"time"
@@ -24,7 +24,6 @@ import (
 	"github.com/akamensky/argparse"
 	"unicode/utf8"
 	"hash/fnv"
-	"gitlab.com/tymonx/go-formatter/formatter"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"golang.org/x/crypto/ssh/terminal"
@@ -32,16 +31,10 @@ import (
 )
 
 const (
-	//HOST            = "192.171.1.2" //host to bind app to
-	//PORT            = 514           //port to bind app to
 	TYPE            = "udp"         //protocol type
 	SESS_CREATE     = "RT_FLOW_SESSION_CREATE"
 	SESS_CLOSE      = "RT_FLOW_SESSION_CLOSE"
 	VALID_SESS_TIME = 10
-	//JET_HOST        = "192.167.1.6"
-	//JET_PORT        = "50051"
-	//JET_USER        = "root"
-	//JET_PASSWD      = "juniper123"
 	TIMEOUT         = 30
 	INDEX           = 0
 )
@@ -62,7 +55,7 @@ type Session struct {
 	jetConn *grpc.ClientConn
 
 	// ribClient is the handle to send gRPC requests JUNOS PRPD RIB service.
-	cliClient mgmt.ManagementClient
+	cliClient fw.FirewallClient
 
 	// cliContext is used for gRPC requests to RIB service.
 	cliContext context.Context
@@ -122,98 +115,109 @@ func HashString(str string) string {
 	return s
 }
 
-// hardcoded fin check term due to mgd bug in handling commitdb + edb ordering
-// remove once fixed 
-func programFinTerm() {
-	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
-	finchk := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term insert='first' operation='create'><name>OFFLOAD-FIN</name><from><source-prefix-list><name>NON-BRONZE-CUSTOMERS</name></source-prefix-list><protocol>tcp</protocol><tcp-flags>(0x11)|(0x14)</tcp-flags></from><then><count>COUNT-FIN</count><next-ip><address>192.168.1.19/32</address><routing-instance><routing-instance-name>SANE-CUSTOMER</routing-instance-name></routing-instance></next-ip></then> </term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term insert='first' operation='create'><name>OFFLOAD-FIN</name><from><destination-prefix-list><name>NON-BRONZE-CUSTOMERS</name></destination-prefix-list><protocol>tcp</protocol><tcp-flags>(0x11)|(0x14)</tcp-flags></from><then><count>COUNT-FIN-REVERSE</count><next-ip><address>192.168.1.21/32</address></next-ip></then></term></filter></inet></family></firewall></configuration>`
-	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
-		Id:        "offload",
-		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
-		Path:      "/",
-		Value: &mgmt.EphemeralConfigSetRequest_ConfigOperation_XmlConfig{
-			XmlConfig: finchk,
-		},
+// program default accept term so that it can fall back to cli filter
+func programDefaultTerm() {
+	cntName := "COUNT-JET-ACCEPT-ALL"
+	Action := &fw.FilterTermInetAction {
+		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}}
+		ActionT: &fw.FilterTermInetTerminatingAction_ACCEPT
 	}
-	configSlice = append(configSlice, cfgOper)
-
-	output := &mgmt.EphemeralConfigSetRequest{
-		InstanceName:     "FLOW_OFFLOAD",
-		ConfigOperations: configSlice,
-		ValidateConfig:   false,
-		LoadOnly:         false,
+	Adj := &fw.FilterAdjacency { Type: "after", TermName: "(null)" }	
+	var filterTermSlice []*fw.FilterTerm
+	filterTerm := &fw.FilterInetTerm {
+		TermName: "JET-ACCEPT-ALL",
+		TermOp: 1 // term add,
+		Adjacency: Adj
+		Actions: Action
+	}
+	filterTermSlice = append(filterTermSlice, filterTerm)
+	
+	// Filter family type : 1 (Ipv4), 2(IPv6)
+	// Filter type: 1(Classic), 0 (Invalid)
+	output := &fw.FilterAddRequest{
+		Name: "FLOW_OFFLOAD",
+		Type: 1,
+		Family: 1,
+		TermsList: filterTermSlice,
 	}
 	fmt.Println(output)
-	resp, err := junos.cliClient.EphemeralConfigSet(junos.cliContext, output)
+	resp, err := junos.cliClient.FilterAdd(junos.cliContext, output)
 	if err != nil {
-		fmt.Println("Failed to program config in eDB ")
+		fmt.Println("Failed to program jet-offload default-term")
 	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
-		fmt.Println("failed to program config in eDB")
+		fmt.Println("failed to program jet-offload default-term")
 	} else {
-		fmt.Println("successfully programmed fincheck term", resp)
+		fmt.Println("successfully programmed jet-offload default-term", resp)
 	}
 }
 
-// program flow to MX on ephemeral database
+// program flow to MX as JET filter
 func addFlow(name string, src_ip string, dst_ip string, src_port string, dst_port string) {
-	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
-
-	xmlTmpl := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term insert='after' key='[name='OFFLOAD-FIN']' operation='create'><name>OFFLOAD_{p}</name><from><source-address><name>{p}</name></source-address><destination-address><name>{p}</name></destination-address><source-port>{p}</source-port><destination-port>{p}</destination-port></from><then><count>count-{p}</count><accept/></then></term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term insert='after' key='[name='OFFLOAD-FIN']' operation='create'><name>OFFLOAD_{p}</name><from><source-address><name>{p}</name></source-address><destination-address><name>{p}</name></destination-address><source-port>{p}</source-port><destination-port>{p}</destination-port></from><then><count>count-reverse-{p}</count><accept/></then></term></filter></inet></family></firewall></configuration>`
-	xmlConfig, err := formatter.Format(xmlTmpl, name, src_ip, dst_ip, src_port, dst_port, name, name, dst_ip, src_ip, dst_port, src_port, name)
-	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
-		Id:        "offload",
-		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
-		Path:      "/",
-		Value: &mgmt.EphemeralConfigSetRequest_ConfigOperation_XmlConfig{
-			XmlConfig: xmlConfig,
-		},
+	Match := &fw.FilterTermMatchInet {
+		//To do: Add protocol if needed
+		Ipv4DstAddrs: dst_ip,
+		Ipv4SrcAddrs: src_ip,
+		DstPorts: dst_port,
+		SrcPorts: src_port,
 	}
-	configSlice = append(configSlice, cfgOper)
-
-	output := &mgmt.EphemeralConfigSetRequest{
-		InstanceName:     "FLOW_OFFLOAD",
-		ConfigOperations: configSlice,
-		ValidateConfig:   false,
-		LoadOnly:         false,
+	cntName := "COUNT-"+name
+	Action := &fw.FilterTermInetAction {
+		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}}
+		ActionT: &fw.FilterTermInetTerminatingAction_ACCEPT
+	}
+	Adj := &fw.FilterAdjacency { Type: "after", TermName: "JET-ACCEPT-ALL" }	
+	var filterTermSlice []*fw.FilterTerm
+	filterTerm := &fw.FilterInetTerm {
+		TermName: "OFFLOAD_"+name,
+		TermOp: 1 // term add,
+		Adjacency: Adj
+		Matches: Match
+		Actions: Action
+	}
+	filterTermSlice = append(filterTermSlice, filterTerm)
+	
+	// Filter family type : 1 (Ipv4), 2(IPv6)
+	// Filter type: 1(Classic), 0 (Invalid)
+	output := &fw.FilterAddRequest{
+		Name: "FLOW_OFFLOAD",
+		Type: 1,
+		Family: 1,
+		TermsList: filterTermSlice,
 	}
 	fmt.Println(output)
-	resp, err := junos.cliClient.EphemeralConfigSet(junos.cliContext, output)
+	resp, err := junos.cliClient.FilterAdd(junos.cliContext, output)
 	if err != nil {
-		fmt.Println("Failed to program config in eDB ")
+		fmt.Println("Failed to program jet-offload filter")
 	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
-		fmt.Println("failed to program config in eDB")
+		fmt.Println("failed to program jet-offload filter")
 	} else {
 		fmt.Println("successfully programmed", resp)
 	}
 }
 
-// delete flow on MX on ephemeral DB
+// delete flow on MX from JET filters
 func delFlow(name string) {
-	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
-	xmlTmpl := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term operation='delete'><name>OFFLOAD_{p}</name></term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term operation='delete'><name>OFFLOAD_{p}</name></term></filter></inet></family></firewall></configuration>`
-	xmlConfig, err := formatter.Format(xmlTmpl, name, name)
-	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
-		Id:        "offload",
-		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
-		Path:      "/",
-		Value: &mgmt.EphemeralConfigSetRequest_ConfigOperation_XmlConfig{
-			XmlConfig: xmlConfig,
-		},
+	var filterTermSlice []*fw.FilterTerm
+	filterTerm := &fw.FilterInetTerm {
+		TermName: "OFFLOAD_"+name,
+		TermOp: 2 // term delete,
 	}
-	configSlice = append(configSlice, cfgOper)
-
-	output := &mgmt.EphemeralConfigSetRequest{
-		InstanceName:     "FLOW_OFFLOAD",
-		ConfigOperations: configSlice,
-		ValidateConfig:   false,
-		LoadOnly:         false,
+	filterTermSlice = append(filterTermSlice, filterTerm)
+	
+	// Filter family type : 1 (Ipv4), 2(IPv6)
+	// Filter type: 1(Classic), 0 (Invalid)
+	output := &mgmt.FilterModifyRequest{
+		Name: "FLOW_OFFLOAD",
+		Types: 1,
+		Family: 1,
+		TermsList: filterTermSlice,
 	}
 	fmt.Println(output)
-	resp, err := junos.cliClient.EphemeralConfigSet(junos.cliContext, output)
+	resp, err := junos.cliClient.FilterModify(junos.cliContext, output)
 	if err != nil {
-		fmt.Println("Failed to program config in eDB ")
+		fmt.Println("Failed to delete flow")
 	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
-		fmt.Println("failed to program config in eDB")
+		fmt.Println("failed to delete flow")
 	} else {
 		fmt.Println("successfully deleted the flow", resp)
 	}
@@ -286,7 +290,6 @@ func programFlow(hflow string) {
 func main() {
 	parser := argparse.NewParser("Required-args", "\n============\ntraffic-offloader\n============")
 	fmt.Println("connected to host ...")
-	//ip := parser.String("h", "ip", &argparse.Options{Required: true, Help: "Ip address to bind app to"})
 	port := parser.String("p", "port", &argparse.Options{Required: true, Help: "Port number to bind app to"})
 	jip := parser.String("J", "jetip", &argparse.Options{Required: true, Help: "Jet host IP "})
 	jport := parser.String("P", "jetport", &argparse.Options{Required: true, Help: "Jet host port"})
@@ -311,9 +314,9 @@ func main() {
 		buf := make([]byte, 1024)
 		//establish connection to  MX over gRPC channel
 		connectJET(*jip + ":" + *jport, *juser, *jpass)
+		//program default accept term to fail over to cli filter for unmatched packets
+		programDefaultTerm()
 		//receive data from udp socket
-		//TO REMOVE: program fin term first! 
-		programFinTerm()
 		for {
 			data, _, _ := serverConn.ReadFromUDP(buf)
 			bufdata := string(buf[0:data])
@@ -331,16 +334,7 @@ func main() {
 				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
 				hflow := HashString(flow)
 				delete(sessTable, hflow)
-				fmt.Println("deleted flowinfo from session table\n")
-				// TO do: delete flow entries from MX as well
-				_, ok := offloadTable[hflow]
-				if ok {
-					fmt.Println("found flow in offload table, deleting...\n")
-					go delFlow(hflow)
-					delete(offloadTable,hflow)
-				} else {
-					fmt.Println(" flow doesnt exist in offloadload table. skipping... \n")
-				}
+				fmt.Println("Received either session close due to session close msg or due to session time out from vSRX. Deleted flowinfo from session table\n")
 			}
 		}
 	}
