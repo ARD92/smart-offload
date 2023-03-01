@@ -32,10 +32,16 @@ import (
 )
 
 const (
+	//HOST            = "192.171.1.2" //host to bind app to
+	//PORT            = 514           //port to bind app to
 	TYPE            = "udp"         //protocol type
 	SESS_CREATE     = "RT_FLOW_SESSION_CREATE"
 	SESS_CLOSE      = "RT_FLOW_SESSION_CLOSE"
-	VALID_SESS_TIME = 5
+	VALID_SESS_TIME = 10
+	//JET_HOST        = "192.167.1.6"
+	//JET_PORT        = "50051"
+	//JET_USER        = "root"
+	//JET_PASSWD      = "juniper123"
 	TIMEOUT         = 30
 	INDEX           = 0
 )
@@ -116,11 +122,44 @@ func HashString(str string) string {
 	return s
 }
 
+// hardcoded fin check term due to mgd bug in handling commitdb + edb ordering
+// remove once fixed 
+func programFinTerm() {
+	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
+	finchk := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term insert='first' operation='create'><name>OFFLOAD-FIN</name><from><source-prefix-list><name>NON-BRONZE-CUSTOMERS</name></source-prefix-list><protocol>tcp</protocol><tcp-flags>(0x11)|(0x14)</tcp-flags></from><then><count>COUNT-FIN</count><next-ip><address>192.168.1.19/32</address><routing-instance><routing-instance-name>SANE-CUSTOMER</routing-instance-name></routing-instance></next-ip></then> </term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term insert='first' operation='create'><name>OFFLOAD-FIN</name><from><destination-prefix-list><name>NON-BRONZE-CUSTOMERS</name></destination-prefix-list><protocol>tcp</protocol><tcp-flags>(0x11)|(0x14)</tcp-flags></from><then><count>COUNT-FIN-REVERSE</count><next-ip><address>192.168.1.21/32</address></next-ip></then></term></filter></inet></family></firewall></configuration>`
+	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
+		Id:        "offload",
+		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
+		Path:      "/",
+		Value: &mgmt.EphemeralConfigSetRequest_ConfigOperation_XmlConfig{
+			XmlConfig: finchk,
+		},
+	}
+	configSlice = append(configSlice, cfgOper)
+
+	output := &mgmt.EphemeralConfigSetRequest{
+		InstanceName:     "FLOW_OFFLOAD",
+		ConfigOperations: configSlice,
+		ValidateConfig:   false,
+		LoadOnly:         false,
+	}
+	fmt.Println(output)
+	resp, err := junos.cliClient.EphemeralConfigSet(junos.cliContext, output)
+	if err != nil {
+		fmt.Println("Failed to program config in eDB ")
+	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
+		fmt.Println("failed to program config in eDB")
+	} else {
+		fmt.Println("successfully programmed fincheck term", resp)
+	}
+}
+
 // program flow to MX on ephemeral database
 func addFlow(name string, src_ip string, dst_ip string, src_port string, dst_port string) {
 	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
-	xmlTmpl := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term insert='after' key='[name='OFFLOAD-FIN']' operation='create'><name>OFFLOAD_{p}</name><from><source-address><name>{p}</name></source-address><destination-address><name>{p}</name></destination-address><source-port>{p}</source-port><destination-port>{p}</destination-port></from><then><accept/></then></term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term insert='after' key='[name='OFFLOAD-FIN']' operation='create'><name>OFFLOAD_{p}</name><from><source-address><name>{p}</name></source-address><destination-address><name>{p}</name></destination-address><source-port>{p}</source-port><destination-port>{p}</destination-port></from><then><accept/></then></term></filter>/inet></family></firewall></configuration>`
-	xmlConfig, err := formatter.Format(xmlTmpl, name, src_ip, dst_ip, src_port, dst_port, name, dst_ip, src_ip, dst_port, src_port)
+
+	xmlTmpl := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term insert='after' key='[name='OFFLOAD-FIN']' operation='create'><name>OFFLOAD_{p}</name><from><source-address><name>{p}</name></source-address><destination-address><name>{p}</name></destination-address><source-port>{p}</source-port><destination-port>{p}</destination-port></from><then><count>count-{p}</count><accept/></then></term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term insert='after' key='[name='OFFLOAD-FIN']' operation='create'><name>OFFLOAD_{p}</name><from><source-address><name>{p}</name></source-address><destination-address><name>{p}</name></destination-address><source-port>{p}</source-port><destination-port>{p}</destination-port></from><then><count>count-reverse-{p}</count><accept/></then></term></filter></inet></family></firewall></configuration>`
+	xmlConfig, err := formatter.Format(xmlTmpl, name, src_ip, dst_ip, src_port, dst_port, name, name, dst_ip, src_ip, dst_port, src_port, name)
 	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
 		Id:        "offload",
 		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
@@ -151,7 +190,7 @@ func addFlow(name string, src_ip string, dst_ip string, src_port string, dst_por
 // delete flow on MX on ephemeral DB
 func delFlow(name string) {
 	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
-	xmlTmpl := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term operation='delete'><name>OFFLOAD_{p}</name></term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term operation='delete'><name>OFFLOAD_{p}</name></term></filter>/inet></family></firewall></configuration>`
+	xmlTmpl := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term operation='delete'><name>OFFLOAD_{p}</name></term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term operation='delete'><name>OFFLOAD_{p}</name></term></filter></inet></family></firewall></configuration>`
 	xmlConfig, err := formatter.Format(xmlTmpl, name, name)
 	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
 		Id:        "offload",
@@ -169,6 +208,7 @@ func delFlow(name string) {
 		ValidateConfig:   false,
 		LoadOnly:         false,
 	}
+	fmt.Println(output)
 	resp, err := junos.cliClient.EphemeralConfigSet(junos.cliContext, output)
 	if err != nil {
 		fmt.Println("Failed to program config in eDB ")
@@ -225,13 +265,19 @@ func parseFlow(buffer string) (sessionValues, string) {
 	return sessionVals, sessType
 }
 
+
+// Map to store {flow1: (sip,dip,sport, dport, protocol, time), flow2:(), flow3:().....}
+var offloadTable = make(map[string]sessionValues)
 //validate flow and offload based on session time threshold
+
 func programFlow(hflow string) {
 	time.Sleep(VALID_SESS_TIME * time.Second)
 	val, ok := sessTable[hflow]
 	if ok {
-		fmt.Println("30 seconds elapsed and flow is still active. adding redirection on MX\n")
+		fmt.Println("valid session time elapsed and flow is still active. adding redirection on MX\n")
 		addFlow(hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
+		offloadTable[hflow] = val
+
 	} else {
 		fmt.Println("flow doesnt exist. skip programming.. \n")
 	}
@@ -240,12 +286,13 @@ func programFlow(hflow string) {
 func main() {
 	parser := argparse.NewParser("Required-args", "\n============\ntraffic-offloader\n============")
 	fmt.Println("connected to host ...")
+	//ip := parser.String("h", "ip", &argparse.Options{Required: true, Help: "Ip address to bind app to"})
 	port := parser.String("p", "port", &argparse.Options{Required: true, Help: "Port number to bind app to"})
 	jip := parser.String("J", "jetip", &argparse.Options{Required: true, Help: "Jet host IP "})
 	jport := parser.String("P", "jetport", &argparse.Options{Required: true, Help: "Jet host port"})
 	//stime := parser.String("s", "sesstime", &argparse.Options{Required: true, Help: "session time to monitor before programming filters"})
 	juser := parser.String("u", "user", &argparse.Options{Required: true, Help: "user name for jet host"})
-	jpass := parser.String("w", "password", &argparse.Options{Required: true, Help: "password for jet host"})
+	jpass := parser.String("w", "password", &argparse.Options{Required: false, Help: "password for jet host"})
 	err := parser.Parse(os.Args)
 	if err != nil {
 		fmt.Print(parser.Usage(err))
@@ -265,6 +312,8 @@ func main() {
 		//establish connection to  MX over gRPC channel
 		connectJET(*jip + ":" + *jport, *juser, *jpass)
 		//receive data from udp socket
+		//TO REMOVE: program fin term first! 
+		programFinTerm()
 		for {
 			data, _, _ := serverConn.ReadFromUDP(buf)
 			bufdata := string(buf[0:data])
@@ -284,9 +333,15 @@ func main() {
 				delete(sessTable, hflow)
 				fmt.Println("deleted flowinfo from session table\n")
 				// TO do: delete flow entries from MX as well
-				go delFlow(hflow)
+				_, ok := offloadTable[hflow]
+				if ok {
+					fmt.Println("found flow in offload table, deleting...\n")
+					go delFlow(hflow)
+					delete(offloadTable,hflow)
+				} else {
+					fmt.Println(" flow doesnt exist in offloadload table. skipping... \n")
+				}
 			}
-			//fmt.Println(sessTable)
 		}
 	}
 }
