@@ -11,9 +11,9 @@ package main
 import (
 	"context"
 	"fmt"
-	auth "jetoffloader/jnx/jet/auth"
-	jnx "jetoffloader/jnx/jet/common"
-	fw "jetoffloader/jnx/jet/firewall"
+	auth "jnx/jet/auth"
+	jnx "jnx/jet/common"
+	fw "jnx/jet/firewall"
 	"net"
 	"strings"
 	"time"
@@ -37,6 +37,9 @@ const (
 	VALID_SESS_TIME = 10
 	TIMEOUT         = 30
 	INDEX           = 0
+	ROUTE_TABLE	= "SERVICE.inet.0"
+	SERVICE_FILTER	= "SERVICE"
+	SERVICE_FILTER_REVERSE	= "SERVICE-REVERSE"
 )
 
 // session values which would be stored in maps
@@ -74,21 +77,19 @@ func connectJET(addr string, juser string, jpass string) error {
 	junos.jetConn = conn
 	clientId := "trafficoffload"
 	md := metadata.Pairs("client-id", clientId)
-	login := auth.NewAuthenticationClient(conn)
+	login := auth.NewLoginClient(conn)
 	loginReq := &auth.LoginRequest{
-		Username: juser,
+		UserName: juser,
 		Password: jpass,
 		ClientId: clientId,
 	}
 	junos.cliContext = metadata.NewOutgoingContext(context.Background(), md)
-	if reply, err := login.Login(junos.cliContext, loginReq); err != nil {
+	if _, err := login.LoginCheck(junos.cliContext, loginReq); err != nil {
 		fmt.Println("Error authenticating..\n")
-	} else if reply.Status.Code != jnx.StatusCode_SUCCESS {
-		fmt.Println("Failed to authenticate\n")
 	}
 	fmt.Println("connected to grpc")
 	junos.cliContext = metadata.NewOutgoingContext(context.Background(), md)
-	junos.cliClient = mgmt.NewManagementClient(conn)
+	junos.cliClient = fw.NewFirewallClient(conn)
 	return nil
 }
 
@@ -115,33 +116,38 @@ func HashString(str string) string {
 	return s
 }
 
+
 // program default accept term so that it can fall back to cli filter
 func programDefaultTerm() {
 	cntName := "COUNT-JET-ACCEPT-ALL"
 	Action := &fw.FilterTermInetAction {
-		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}}
-		ActionT: &fw.FilterTermInetTerminatingAction_ACCEPT
+		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}},
+		ActionT: &fw.FilterTermInetTerminatingAction {TerminatingAction: &fw.FilterTermInetTerminatingAction_Accept {Accept: true}},
 	}
-	Adj := &fw.FilterAdjacency { Type: "after", TermName: "(null)" }	
+	Adj := &fw.FilterAdjacency { Type: fw.FilterAdjacencyType_TERM_AFTER, TermName: "(null)" }
 	var filterTermSlice []*fw.FilterTerm
-	filterTerm := &fw.FilterInetTerm {
-		TermName: "JET-ACCEPT-ALL",
-		TermOp: 1 // term add,
-		Adjacency: Adj
-		Actions: Action
+	filterTerm := &fw.FilterTerm {
+		FilterTerm : &fw.FilterTerm_InetTerm {
+			InetTerm : &fw.FilterInetTerm { 
+				TermName: "JET-ACCEPT-ALL",
+				TermOp: fw.FilterTermOperation_TERM_OPERATION_ADD,
+				Adjacency: Adj,
+				Actions: Action,
+			},
+		},
 	}
 	filterTermSlice = append(filterTermSlice, filterTerm)
-	
+
 	// Filter family type : 1 (Ipv4), 2(IPv6)
 	// Filter type: 1(Classic), 0 (Invalid)
-	output := &fw.FilterAddRequest{
+	addreq := &fw.FilterAddRequest{
 		Name: "FLOW_OFFLOAD",
-		Type: 1,
-		Family: 1,
+		Type: fw.FilterTypes_TYPE_CLASSIC,
+		Family: fw.FilterFamilies_FAMILY_INET,
 		TermsList: filterTermSlice,
 	}
-	fmt.Println(output)
-	resp, err := junos.cliClient.FilterAdd(junos.cliContext, output)
+	fmt.Println(addreq)
+	resp, err := junos.cliClient.FilterAdd(junos.cliContext, addreq)
 	if err != nil {
 		fmt.Println("Failed to program jet-offload default-term")
 	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
@@ -152,7 +158,7 @@ func programDefaultTerm() {
 }
 
 // program flow to MX as JET filter
-func addFlow(name string, src_ip string, dst_ip string, src_port string, dst_port string) {
+/*func addFlow(name string, src_ip string, dst_ip string, src_port string, dst_port string) {
 	Match := &fw.FilterTermMatchInet {
 		//To do: Add protocol if needed
 		Ipv4DstAddrs: dst_ip,
@@ -165,7 +171,7 @@ func addFlow(name string, src_ip string, dst_ip string, src_port string, dst_por
 		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}}
 		ActionT: &fw.FilterTermInetTerminatingAction_ACCEPT
 	}
-	Adj := &fw.FilterAdjacency { Type: "after", TermName: "JET-ACCEPT-ALL" }	
+	Adj := &fw.FilterAdjacency { Type: "after", TermName: "JET-ACCEPT-ALL" }
 	var filterTermSlice []*fw.FilterTerm
 	filterTerm := &fw.FilterInetTerm {
 		TermName: "OFFLOAD_"+name,
@@ -175,7 +181,6 @@ func addFlow(name string, src_ip string, dst_ip string, src_port string, dst_por
 		Actions: Action
 	}
 	filterTermSlice = append(filterTermSlice, filterTerm)
-	
 	// Filter family type : 1 (Ipv4), 2(IPv6)
 	// Filter type: 1(Classic), 0 (Invalid)
 	output := &fw.FilterAddRequest{
@@ -203,7 +208,6 @@ func delFlow(name string) {
 		TermOp: 2 // term delete,
 	}
 	filterTermSlice = append(filterTermSlice, filterTerm)
-	
 	// Filter family type : 1 (Ipv4), 2(IPv6)
 	// Filter type: 1(Classic), 0 (Invalid)
 	output := &mgmt.FilterModifyRequest{
@@ -221,7 +225,7 @@ func delFlow(name string) {
 	} else {
 		fmt.Println("successfully deleted the flow", resp)
 	}
-}
+}*/
 
 var sessionVals sessionValues
 
@@ -275,13 +279,18 @@ var offloadTable = make(map[string]sessionValues)
 //validate flow and offload based on session time threshold
 
 func programFlow(hflow string) {
-	time.Sleep(VALID_SESS_TIME * time.Second)
+	fmt.Println("entering programFlow\n")
+	//time.Sleep(VALID_SESS_TIME * time.Second)
+	ticker := 0
+	for ticker < VALID_SESS_TIME {
+		ticker = ticker + 1
+	}
 	val, ok := sessTable[hflow]
 	if ok {
 		fmt.Println("valid session time elapsed and flow is still active. adding redirection on MX\n")
-		addFlow(hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
 		offloadTable[hflow] = val
-
+		//addFlow(hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
+		fmt.Println("added entry to offload table")
 	} else {
 		fmt.Println("flow doesnt exist. skip programming.. \n")
 	}
@@ -293,7 +302,6 @@ func main() {
 	port := parser.String("p", "port", &argparse.Options{Required: true, Help: "Port number to bind app to"})
 	jip := parser.String("J", "jetip", &argparse.Options{Required: true, Help: "Jet host IP "})
 	jport := parser.String("P", "jetport", &argparse.Options{Required: true, Help: "Jet host port"})
-	//stime := parser.String("s", "sesstime", &argparse.Options{Required: true, Help: "session time to monitor before programming filters"})
 	juser := parser.String("u", "user", &argparse.Options{Required: true, Help: "user name for jet host"})
 	jpass := parser.String("w", "password", &argparse.Options{Required: false, Help: "password for jet host"})
 	err := parser.Parse(os.Args)
@@ -309,14 +317,16 @@ func main() {
 			*jpass = string(bytePassword)
 		}
 		PORT,_ := strconv.Atoi(*port)
-		//SESSTIME,_ := strconv.Atoi(*stime) 
 		serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: []byte{0, 0, 0, 0}, Port: PORT, Zone: ""})
 		buf := make([]byte, 1024)
+
 		//establish connection to  MX over gRPC channel
 		connectJET(*jip + ":" + *jport, *juser, *jpass)
+
 		//program default accept term to fail over to cli filter for unmatched packets
 		programDefaultTerm()
-		//receive data from udp socket
+
+		//receive data from udp socket 
 		for {
 			data, _, _ := serverConn.ReadFromUDP(buf)
 			bufdata := string(buf[0:data])
