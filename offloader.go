@@ -11,9 +11,9 @@ package main
 import (
 	"context"
 	"fmt"
-	auth "jetoffloader/jnx/jet/auth"
-	jnx "jetoffloader/jnx/jet/common"
-	mgmt "jetoffloader/jnx/jet/mgmt"
+	auth "jnx/jet/auth"
+	jnx "jnx/jet/common"
+	fw "jnx/jet/firewall"
 	"net"
 	"strings"
 	"time"
@@ -24,7 +24,6 @@ import (
 	"github.com/akamensky/argparse"
 	"unicode/utf8"
 	"hash/fnv"
-	"gitlab.com/tymonx/go-formatter/formatter"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"golang.org/x/crypto/ssh/terminal"
@@ -35,9 +34,12 @@ const (
 	TYPE            = "udp"         //protocol type
 	SESS_CREATE     = "RT_FLOW_SESSION_CREATE"
 	SESS_CLOSE      = "RT_FLOW_SESSION_CLOSE"
-	VALID_SESS_TIME = 5
+	VALID_SESS_TIME = 30
 	TIMEOUT         = 30
 	INDEX           = 0
+	ROUTE_TABLE	= "SERVICE.inet.0"
+	SERVICE_FILTER	= "SERVICE"
+	SERVICE_FILTER_REVERSE	= "SERVICE-REVERSE"
 )
 
 // session values which would be stored in maps
@@ -56,7 +58,7 @@ type Session struct {
 	jetConn *grpc.ClientConn
 
 	// ribClient is the handle to send gRPC requests JUNOS PRPD RIB service.
-	cliClient mgmt.ManagementClient
+	cliClient fw.FirewallClient
 
 	// cliContext is used for gRPC requests to RIB service.
 	cliContext context.Context
@@ -75,21 +77,19 @@ func connectJET(addr string, juser string, jpass string) error {
 	junos.jetConn = conn
 	clientId := "trafficoffload"
 	md := metadata.Pairs("client-id", clientId)
-	login := auth.NewAuthenticationClient(conn)
+	login := auth.NewLoginClient(conn)
 	loginReq := &auth.LoginRequest{
-		Username: juser,
+		UserName: juser,
 		Password: jpass,
 		ClientId: clientId,
 	}
 	junos.cliContext = metadata.NewOutgoingContext(context.Background(), md)
-	if reply, err := login.Login(junos.cliContext, loginReq); err != nil {
+	if _, err := login.LoginCheck(junos.cliContext, loginReq); err != nil {
 		fmt.Println("Error authenticating..\n")
-	} else if reply.Status.Code != jnx.StatusCode_SUCCESS {
-		fmt.Println("Failed to authenticate\n")
 	}
 	fmt.Println("connected to grpc")
 	junos.cliContext = metadata.NewOutgoingContext(context.Background(), md)
-	junos.cliClient = mgmt.NewManagementClient(conn)
+	junos.cliClient = fw.NewFirewallClient(conn)
 	return nil
 }
 
@@ -116,68 +116,160 @@ func HashString(str string) string {
 	return s
 }
 
-// program flow to MX on ephemeral database
-func addFlow(name string, src_ip string, dst_ip string, src_port string, dst_port string) {
-	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
-	xmlTmpl := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term insert='after' key='[name='OFFLOAD-FIN']' operation='create'><name>OFFLOAD_{p}</name><from><source-address><name>{p}</name></source-address><destination-address><name>{p}</name></destination-address><source-port>{p}</source-port><destination-port>{p}</destination-port></from><then><accept/></then></term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term insert='after' key='[name='OFFLOAD-FIN']' operation='create'><name>OFFLOAD_{p}</name><from><source-address><name>{p}</name></source-address><destination-address><name>{p}</name></destination-address><source-port>{p}</source-port><destination-port>{p}</destination-port></from><then><accept/></then></term></filter>/inet></family></firewall></configuration>`
-	xmlConfig, err := formatter.Format(xmlTmpl, name, src_ip, dst_ip, src_port, dst_port, name, dst_ip, src_ip, dst_port, src_port)
-	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
-		Id:        "offload",
-		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
-		Path:      "/",
-		Value: &mgmt.EphemeralConfigSetRequest_ConfigOperation_XmlConfig{
-			XmlConfig: xmlConfig,
+
+// program default accept term so that it can fall back to cli filter
+func programDefaultTerm(filtername string) {
+	cntName := "COUNT-JET-ACCEPT-ALL"
+	Action := &fw.FilterTermInetAction {
+		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}},
+		ActionT: &fw.FilterTermInetTerminatingAction {TerminatingAction: &fw.FilterTermInetTerminatingAction_Accept {Accept: true}},
+	}
+	Adj := &fw.FilterAdjacency { Type: fw.FilterAdjacencyType_TERM_AFTER, TermName: "(null)" }
+	var filterTermSlice []*fw.FilterTerm
+	filterTerm := &fw.FilterTerm {
+		FilterTerm : &fw.FilterTerm_InetTerm {
+			InetTerm : &fw.FilterInetTerm { 
+				TermName: "JET-ACCEPT-ALL",
+				TermOp: fw.FilterTermOperation_TERM_OPERATION_ADD,
+				Adjacency: Adj,
+				Actions: Action,
+			},
 		},
 	}
-	configSlice = append(configSlice, cfgOper)
-
-	output := &mgmt.EphemeralConfigSetRequest{
-		InstanceName:     "FLOW_OFFLOAD",
-		ConfigOperations: configSlice,
-		ValidateConfig:   false,
-		LoadOnly:         false,
+	filterTermSlice = append(filterTermSlice, filterTerm)
+	// Filter family type : 1 (Ipv4), 2(IPv6)
+	// Filter type: 1(Classic), 0 (Invalid)
+	addreq := &fw.FilterAddRequest{
+		Name: filtername,
+		Type: fw.FilterTypes_TYPE_CLASSIC,
+		Family: fw.FilterFamilies_FAMILY_INET,
+		TermsList: filterTermSlice,
 	}
-	fmt.Println(output)
-	resp, err := junos.cliClient.EphemeralConfigSet(junos.cliContext, output)
+	fmt.Println(addreq)
+	resp, err := junos.cliClient.FilterAdd(junos.cliContext, addreq)
 	if err != nil {
-		fmt.Println("Failed to program config in eDB ")
+		fmt.Println("Failed to program jet-offload default-term")
 	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
-		fmt.Println("failed to program config in eDB")
+		fmt.Println("failed to program jet-offload default-term")
+	} else {
+		fmt.Println("successfully programmed jet-offload default-term", resp)
+	}
+}
+
+
+// program flow to MX as JET filter
+func addFlow(filtername string, name string, src_ip string, dst_ip string, src_port string, dst_port string) {
+	idstport,_ := strconv.Atoi(dst_port)
+	isrcport,_ := strconv.Atoi(src_port)
+	udstport := uint32(idstport)
+	usrcport := uint32(isrcport)
+	dstAddr := &fw.MatchIpAddress {
+		Addr: &jnx.IpAddress {
+			AddrFormat: &jnx.IpAddress_AddrString {
+				AddrString: dst_ip,
+			},
+		},
+		PrefixLength: 32,
+		Operation: fw.MatchOperation_OP_EQUAL,
+	}
+	srcAddr := &fw.MatchIpAddress {
+		Addr: &jnx.IpAddress {
+			AddrFormat: &jnx.IpAddress_AddrString {
+				AddrString: src_ip,
+			},
+		},
+		PrefixLength: 32,
+		Operation: fw.MatchOperation_OP_EQUAL,
+	}
+	dstPort := &fw.MatchPort {
+		Min: udstport,
+		Max: udstport,
+		Operation: fw.MatchOperation_OP_EQUAL,
+	}
+	srcPort := &fw.MatchPort {
+		Min: usrcport,
+		Max: usrcport,
+		Operation: fw.MatchOperation_OP_EQUAL,
+	}
+	var dstAddrSlice []*fw.MatchIpAddress
+	var srcAddrSlice []*fw.MatchIpAddress
+	var dstPortSlice []*fw.MatchPort
+	var srcPortSlice []*fw.MatchPort
+	dstAddrSlice = append(dstAddrSlice, dstAddr)
+	dstPortSlice = append(dstPortSlice, dstPort)
+	srcAddrSlice = append(srcAddrSlice, srcAddr)
+	srcPortSlice = append(srcPortSlice, srcPort)
+	Match := &fw.FilterTermMatchInet {
+		//To do: Add protocol if needed
+		Ipv4DstAddrs: dstAddrSlice,
+		Ipv4SrcAddrs: srcAddrSlice,
+		DstPorts: dstPortSlice,
+		SrcPorts: srcPortSlice,
+	}
+	cntName := "COUNT-"+name
+	Action := &fw.FilterTermInetAction {
+		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}},
+		ActionT: &fw.FilterTermInetTerminatingAction {TerminatingAction: &fw.FilterTermInetTerminatingAction_Accept {Accept: true}},
+	}
+	Adj := &fw.FilterAdjacency { Type: fw.FilterAdjacencyType_TERM_AFTER, TermName: "JET-ACCEPT-ALL" } // JET-ACCEPT-ALL will be placed after definining term
+	var filterTermSlice []*fw.FilterTerm
+	filterTerm := &fw.FilterTerm {
+		FilterTerm : &fw.FilterTerm_InetTerm {
+			InetTerm : &fw.FilterInetTerm { 
+				TermName: "OFFLOAD_"+name,
+				TermOp: fw.FilterTermOperation_TERM_OPERATION_ADD,
+				Adjacency: Adj,
+				Matches: Match,
+				Actions: Action,
+			},
+		},
+	}
+	filterTermSlice = append(filterTermSlice, filterTerm)
+	// Filter family type : 1 (Ipv4), 2(IPv6)
+	// Filter type: 1(Classic), 0 (Invalid)
+	addreq := &fw.FilterModifyRequest{
+		Name: filtername,
+		Type: fw.FilterTypes_TYPE_CLASSIC,
+		Family: fw.FilterFamilies_FAMILY_INET,
+		TermsList: filterTermSlice,
+	}
+	fmt.Println(addreq)
+	resp, err := junos.cliClient.FilterModify(junos.cliContext, addreq)
+	if err != nil {
+		fmt.Println("Failed to program jet-offload filter")
+	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
+		fmt.Println("failed to program jet-offload filter")
 	} else {
 		fmt.Println("successfully programmed", resp)
 	}
 }
 
-// delete flow on MX on ephemeral DB
-func delFlow(name string) {
-	var configSlice []*mgmt.EphemeralConfigSetRequest_ConfigOperation
-	xmlTmpl := `<configuration><firewall><family><inet><filter><name>SANE_SERVICE</name><term operation='delete'><name>OFFLOAD_{p}</name></term></filter></inet></family></firewall><firewall><family><inet><filter><name>SANE_SERVICE_REVERSE</name><term operation='delete'><name>OFFLOAD_{p}</name></term></filter>/inet></family></firewall></configuration>`
-	xmlConfig, err := formatter.Format(xmlTmpl, name, name)
-	cfgOper := &mgmt.EphemeralConfigSetRequest_ConfigOperation{
-		Id:        "offload",
-		Operation: mgmt.ConfigOperationType_CONFIG_OPERATION_UPDATE,
-		Path:      "/",
-		Value: &mgmt.EphemeralConfigSetRequest_ConfigOperation_XmlConfig{
-			XmlConfig: xmlConfig,
-		},
+// delete flow on MX from JET filters
+/*func delFlow(name string) {
+	var filterTermSlice []*fw.FilterTerm
+	filterTerm := &fw.FilterInetTerm {
+		TermName: "OFFLOAD_"+name,
+		TermOp: 2 // term delete,
 	}
-	configSlice = append(configSlice, cfgOper)
-
-	output := &mgmt.EphemeralConfigSetRequest{
-		InstanceName:     "FLOW_OFFLOAD",
-		ConfigOperations: configSlice,
-		ValidateConfig:   false,
-		LoadOnly:         false,
+	filterTermSlice = append(filterTermSlice, filterTerm)
+	// Filter family type : 1 (Ipv4), 2(IPv6)
+	// Filter type: 1(Classic), 0 (Invalid)
+	output := &mgmt.FilterModifyRequest{
+		Name: "FLOW_OFFLOAD",
+		Types: 1,
+		Family: 1,
+		TermsList: filterTermSlice,
 	}
-	resp, err := junos.cliClient.EphemeralConfigSet(junos.cliContext, output)
+	fmt.Println(output)
+	resp, err := junos.cliClient.FilterModify(junos.cliContext, output)
 	if err != nil {
-		fmt.Println("Failed to program config in eDB ")
+		fmt.Println("Failed to delete flow")
 	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
-		fmt.Println("failed to program config in eDB")
+		fmt.Println("failed to delete flow")
 	} else {
 		fmt.Println("successfully deleted the flow", resp)
 	}
-}
+}*/
 
 var sessionVals sessionValues
 
@@ -225,13 +317,20 @@ func parseFlow(buffer string) (sessionValues, string) {
 	return sessionVals, sessType
 }
 
+
+// Map to store {flow1: (sip,dip,sport, dport, protocol, time), flow2:(), flow3:().....}
+var offloadTable = make(map[string]sessionValues)
 //validate flow and offload based on session time threshold
+
 func programFlow(hflow string) {
+	fmt.Println("entering programFlow\n")
 	time.Sleep(VALID_SESS_TIME * time.Second)
 	val, ok := sessTable[hflow]
 	if ok {
-		fmt.Println("30 seconds elapsed and flow is still active. adding redirection on MX\n")
-		addFlow(hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
+		fmt.Println(time.Now(),"valid session time elapsed and flow is still active. adding redirection on MX\n")
+		offloadTable[hflow] = val
+		addFlow("FLOW_OFFLOAD", hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
+		fmt.Println("added entry to offload table")
 	} else {
 		fmt.Println("flow doesnt exist. skip programming.. \n")
 	}
@@ -243,9 +342,8 @@ func main() {
 	port := parser.String("p", "port", &argparse.Options{Required: true, Help: "Port number to bind app to"})
 	jip := parser.String("J", "jetip", &argparse.Options{Required: true, Help: "Jet host IP "})
 	jport := parser.String("P", "jetport", &argparse.Options{Required: true, Help: "Jet host port"})
-	//stime := parser.String("s", "sesstime", &argparse.Options{Required: true, Help: "session time to monitor before programming filters"})
 	juser := parser.String("u", "user", &argparse.Options{Required: true, Help: "user name for jet host"})
-	jpass := parser.String("w", "password", &argparse.Options{Required: true, Help: "password for jet host"})
+	jpass := parser.String("w", "password", &argparse.Options{Required: false, Help: "password for jet host"})
 	err := parser.Parse(os.Args)
 	if err != nil {
 		fmt.Print(parser.Usage(err))
@@ -259,12 +357,16 @@ func main() {
 			*jpass = string(bytePassword)
 		}
 		PORT,_ := strconv.Atoi(*port)
-		//SESSTIME,_ := strconv.Atoi(*stime) 
 		serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: []byte{0, 0, 0, 0}, Port: PORT, Zone: ""})
 		buf := make([]byte, 1024)
+
 		//establish connection to  MX over gRPC channel
 		connectJET(*jip + ":" + *jport, *juser, *jpass)
-		//receive data from udp socket
+
+		//program default accept term to fail over to cli filter for unmatched packets. Pass filtername name
+		programDefaultTerm("FLOW_OFFLOAD")
+
+		//receive data from udp socket 
 		for {
 			data, _, _ := serverConn.ReadFromUDP(buf)
 			bufdata := string(buf[0:data])
@@ -275,18 +377,16 @@ func main() {
 				hflow := HashString(flow)
 				sessTable[hflow] = vals
 				go programFlow(hflow)
-				fmt.Println("added flowinfo to session table\n")
+				fmt.Println(time.Now(), "added flowinfo to session table\n")
 
 			} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
 				fmt.Println("deleting flow...")
 				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
 				hflow := HashString(flow)
+				time.Now()
 				delete(sessTable, hflow)
-				fmt.Println("deleted flowinfo from session table\n")
-				// TO do: delete flow entries from MX as well
-				go delFlow(hflow)
+				fmt.Println(time.Now(),"Received either session close due to session close msg or due to session time out from vSRX. Deleted flowinfo from session table\n")
 			}
-			//fmt.Println(sessTable)
 		}
 	}
 }
