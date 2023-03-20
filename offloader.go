@@ -34,7 +34,7 @@ const (
 	TYPE            = "udp"         //protocol type
 	SESS_CREATE     = "RT_FLOW_SESSION_CREATE"
 	SESS_CLOSE      = "RT_FLOW_SESSION_CLOSE"
-	VALID_SESS_TIME = 10
+	VALID_SESS_TIME = 30
 	TIMEOUT         = 30
 	INDEX           = 0
 	ROUTE_TABLE	= "SERVICE.inet.0"
@@ -118,7 +118,7 @@ func HashString(str string) string {
 
 
 // program default accept term so that it can fall back to cli filter
-func programDefaultTerm() {
+func programDefaultTerm(filtername string) {
 	cntName := "COUNT-JET-ACCEPT-ALL"
 	Action := &fw.FilterTermInetAction {
 		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}},
@@ -137,11 +137,10 @@ func programDefaultTerm() {
 		},
 	}
 	filterTermSlice = append(filterTermSlice, filterTerm)
-
 	// Filter family type : 1 (Ipv4), 2(IPv6)
 	// Filter type: 1(Classic), 0 (Invalid)
 	addreq := &fw.FilterAddRequest{
-		Name: "FLOW_OFFLOAD",
+		Name: filtername,
 		Type: fw.FilterTypes_TYPE_CLASSIC,
 		Family: fw.FilterFamilies_FAMILY_INET,
 		TermsList: filterTermSlice,
@@ -157,40 +156,85 @@ func programDefaultTerm() {
 	}
 }
 
+
 // program flow to MX as JET filter
-/*func addFlow(name string, src_ip string, dst_ip string, src_port string, dst_port string) {
+func addFlow(filtername string, name string, src_ip string, dst_ip string, src_port string, dst_port string) {
+	idstport,_ := strconv.Atoi(dst_port)
+	isrcport,_ := strconv.Atoi(src_port)
+	udstport := uint32(idstport)
+	usrcport := uint32(isrcport)
+	dstAddr := &fw.MatchIpAddress {
+		Addr: &jnx.IpAddress {
+			AddrFormat: &jnx.IpAddress_AddrString {
+				AddrString: dst_ip,
+			},
+		},
+		PrefixLength: 32,
+		Operation: fw.MatchOperation_OP_EQUAL,
+	}
+	srcAddr := &fw.MatchIpAddress {
+		Addr: &jnx.IpAddress {
+			AddrFormat: &jnx.IpAddress_AddrString {
+				AddrString: src_ip,
+			},
+		},
+		PrefixLength: 32,
+		Operation: fw.MatchOperation_OP_EQUAL,
+	}
+	dstPort := &fw.MatchPort {
+		Min: udstport,
+		Max: udstport,
+		Operation: fw.MatchOperation_OP_EQUAL,
+	}
+	srcPort := &fw.MatchPort {
+		Min: usrcport,
+		Max: usrcport,
+		Operation: fw.MatchOperation_OP_EQUAL,
+	}
+	var dstAddrSlice []*fw.MatchIpAddress
+	var srcAddrSlice []*fw.MatchIpAddress
+	var dstPortSlice []*fw.MatchPort
+	var srcPortSlice []*fw.MatchPort
+	dstAddrSlice = append(dstAddrSlice, dstAddr)
+	dstPortSlice = append(dstPortSlice, dstPort)
+	srcAddrSlice = append(srcAddrSlice, srcAddr)
+	srcPortSlice = append(srcPortSlice, srcPort)
 	Match := &fw.FilterTermMatchInet {
 		//To do: Add protocol if needed
-		Ipv4DstAddrs: dst_ip,
-		Ipv4SrcAddrs: src_ip,
-		DstPorts: dst_port,
-		SrcPorts: src_port,
+		Ipv4DstAddrs: dstAddrSlice,
+		Ipv4SrcAddrs: srcAddrSlice,
+		DstPorts: dstPortSlice,
+		SrcPorts: srcPortSlice,
 	}
 	cntName := "COUNT-"+name
 	Action := &fw.FilterTermInetAction {
-		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}}
-		ActionT: &fw.FilterTermInetTerminatingAction_ACCEPT
+		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}},
+		ActionT: &fw.FilterTermInetTerminatingAction {TerminatingAction: &fw.FilterTermInetTerminatingAction_Accept {Accept: true}},
 	}
-	Adj := &fw.FilterAdjacency { Type: "after", TermName: "JET-ACCEPT-ALL" }
+	Adj := &fw.FilterAdjacency { Type: fw.FilterAdjacencyType_TERM_AFTER, TermName: "JET-ACCEPT-ALL" } // JET-ACCEPT-ALL will be placed after definining term
 	var filterTermSlice []*fw.FilterTerm
-	filterTerm := &fw.FilterInetTerm {
-		TermName: "OFFLOAD_"+name,
-		TermOp: 1 // term add,
-		Adjacency: Adj
-		Matches: Match
-		Actions: Action
+	filterTerm := &fw.FilterTerm {
+		FilterTerm : &fw.FilterTerm_InetTerm {
+			InetTerm : &fw.FilterInetTerm { 
+				TermName: "OFFLOAD_"+name,
+				TermOp: fw.FilterTermOperation_TERM_OPERATION_ADD,
+				Adjacency: Adj,
+				Matches: Match,
+				Actions: Action,
+			},
+		},
 	}
 	filterTermSlice = append(filterTermSlice, filterTerm)
 	// Filter family type : 1 (Ipv4), 2(IPv6)
 	// Filter type: 1(Classic), 0 (Invalid)
-	output := &fw.FilterAddRequest{
-		Name: "FLOW_OFFLOAD",
-		Type: 1,
-		Family: 1,
+	addreq := &fw.FilterModifyRequest{
+		Name: filtername,
+		Type: fw.FilterTypes_TYPE_CLASSIC,
+		Family: fw.FilterFamilies_FAMILY_INET,
 		TermsList: filterTermSlice,
 	}
-	fmt.Println(output)
-	resp, err := junos.cliClient.FilterAdd(junos.cliContext, output)
+	fmt.Println(addreq)
+	resp, err := junos.cliClient.FilterModify(junos.cliContext, addreq)
 	if err != nil {
 		fmt.Println("Failed to program jet-offload filter")
 	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
@@ -201,7 +245,7 @@ func programDefaultTerm() {
 }
 
 // delete flow on MX from JET filters
-func delFlow(name string) {
+/*func delFlow(name string) {
 	var filterTermSlice []*fw.FilterTerm
 	filterTerm := &fw.FilterInetTerm {
 		TermName: "OFFLOAD_"+name,
@@ -280,16 +324,12 @@ var offloadTable = make(map[string]sessionValues)
 
 func programFlow(hflow string) {
 	fmt.Println("entering programFlow\n")
-	//time.Sleep(VALID_SESS_TIME * time.Second)
-	ticker := 0
-	for ticker < VALID_SESS_TIME {
-		ticker = ticker + 1
-	}
+	time.Sleep(VALID_SESS_TIME * time.Second)
 	val, ok := sessTable[hflow]
 	if ok {
-		fmt.Println("valid session time elapsed and flow is still active. adding redirection on MX\n")
+		fmt.Println(time.Now(),"valid session time elapsed and flow is still active. adding redirection on MX\n")
 		offloadTable[hflow] = val
-		//addFlow(hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
+		addFlow("FLOW_OFFLOAD", hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
 		fmt.Println("added entry to offload table")
 	} else {
 		fmt.Println("flow doesnt exist. skip programming.. \n")
@@ -323,8 +363,8 @@ func main() {
 		//establish connection to  MX over gRPC channel
 		connectJET(*jip + ":" + *jport, *juser, *jpass)
 
-		//program default accept term to fail over to cli filter for unmatched packets
-		programDefaultTerm()
+		//program default accept term to fail over to cli filter for unmatched packets. Pass filtername name
+		programDefaultTerm("FLOW_OFFLOAD")
 
 		//receive data from udp socket 
 		for {
@@ -337,14 +377,15 @@ func main() {
 				hflow := HashString(flow)
 				sessTable[hflow] = vals
 				go programFlow(hflow)
-				fmt.Println("added flowinfo to session table\n")
+				fmt.Println(time.Now(), "added flowinfo to session table\n")
 
 			} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
 				fmt.Println("deleting flow...")
 				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
 				hflow := HashString(flow)
+				time.Now()
 				delete(sessTable, hflow)
-				fmt.Println("Received either session close due to session close msg or due to session time out from vSRX. Deleted flowinfo from session table\n")
+				fmt.Println(time.Now(),"Received either session close due to session close msg or due to session time out from vSRX. Deleted flowinfo from session table\n")
 			}
 		}
 	}
