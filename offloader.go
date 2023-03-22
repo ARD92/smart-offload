@@ -38,8 +38,8 @@ const (
 	TIMEOUT         = 30
 	INDEX           = 0
 	ROUTE_TABLE	= "SERVICE.inet.0"
-	SERVICE_FILTER	= "SERVICE"
-	SERVICE_FILTER_REVERSE	= "SERVICE-REVERSE"
+	SERVICE_FILTER	= "FLOW_OFFLOAD"
+	SERVICE_FILTER_REVERSE	= "FLOW_OFFLOAD_REVERSE"
 )
 
 // session values which would be stored in maps
@@ -145,14 +145,14 @@ func programDefaultTerm(filtername string) {
 		Family: fw.FilterFamilies_FAMILY_INET,
 		TermsList: filterTermSlice,
 	}
-	fmt.Println(addreq)
+	log.Println(addreq)
 	resp, err := junos.cliClient.FilterAdd(junos.cliContext, addreq)
 	if err != nil {
-		fmt.Println("Failed to program jet-offload default-term")
+		log.Println("Failed to program jet-offload default-term")
 	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
-		fmt.Println("failed to program jet-offload default-term")
+		log.Println("failed to program jet-offload default-term")
 	} else {
-		fmt.Println("successfully programmed jet-offload default-term", resp)
+		log.Println("successfully programmed jet-offload default-term", resp)
 	}
 }
 
@@ -233,14 +233,14 @@ func addFlow(filtername string, name string, src_ip string, dst_ip string, src_p
 		Family: fw.FilterFamilies_FAMILY_INET,
 		TermsList: filterTermSlice,
 	}
-	fmt.Println(addreq)
+	log.Println(addreq)
 	resp, err := junos.cliClient.FilterModify(junos.cliContext, addreq)
 	if err != nil {
-		fmt.Println("Failed to program jet-offload filter")
+		log.Println("Failed to program jet-offload filter")
 	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
-		fmt.Println("failed to program jet-offload filter")
+		log.Println("failed to program jet-offload filter")
 	} else {
-		fmt.Println("successfully programmed", resp)
+		log.Println("successfully programmed", resp)
 	}
 }
 
@@ -281,7 +281,7 @@ func parseFlow(buffer string) (sessionValues, string) {
 	datasplit := strings.Split(buffer, " ")
 	sessType := strings.TrimRight(datasplit[5], " ")
 	if strings.Compare(sessType, SESS_CREATE) == 0 {
-		fmt.Println("session create received")
+		//fmt.Println("session create received")
 		sessionVals.session_time = datasplit[1]
 		for i := 7; i <= 10; i++ {
 			val := strings.Split(datasplit[i], "=")
@@ -297,8 +297,7 @@ func parseFlow(buffer string) (sessionValues, string) {
 			}
 		}
 	} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
-		fmt.Println("session close received..")
-		fmt.Println(datasplit)
+		//fmt.Println("session close received..")
 		sessionVals.session_time = datasplit[1]
 		for i := 7; i <= 10; i++ {
 			val := strings.Split(datasplit[i], "=")
@@ -323,22 +322,29 @@ var offloadTable = make(map[string]sessionValues)
 //validate flow and offload based on session time threshold
 
 func programFlow(hflow string) {
-	fmt.Println("entering programFlow\n")
 	time.Sleep(VALID_SESS_TIME * time.Second)
 	val, ok := sessTable[hflow]
 	if ok {
-		fmt.Println(time.Now(),"valid session time elapsed and flow is still active. adding redirection on MX\n")
+		log.Println(time.Now(),"valid session time elapsed and flow is still active. adding redirection on MX\n")
 		offloadTable[hflow] = val
-		addFlow("FLOW_OFFLOAD", hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
-		fmt.Println("added entry to offload table")
+		addFlow(SERVICE_FILTER, hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
+		addFlow(SERVICE_FILTER_REVERSE, hflow, val.dest_ip, val.source_ip, val.dest_port, val.source_port)
+		log.Println("added entry to offload table")
 	} else {
-		fmt.Println("flow doesnt exist. skip programming.. \n")
+		log.Println("flow doesnt exist. skip programming.. \n")
 	}
 }
 
 func main() {
+	logs, logerr := os.OpenFile("offloader.log", os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
+	if logerr != nil {
+		log.Fatalf("Error opening file: %v", logerr)
+	}
+	defer logs.Close()
+	log.SetOutput(logs)
+
 	parser := argparse.NewParser("Required-args", "\n============\ntraffic-offloader\n============")
-	fmt.Println("connected to host ...")
+	log.Println("connected to host ...")
 	port := parser.String("p", "port", &argparse.Options{Required: true, Help: "Port number to bind app to"})
 	jip := parser.String("J", "jetip", &argparse.Options{Required: true, Help: "Jet host IP "})
 	jport := parser.String("P", "jetport", &argparse.Options{Required: true, Help: "Jet host port"})
@@ -356,6 +362,8 @@ func main() {
 			}
 			*jpass = string(bytePassword)
 		}
+
+
 		PORT,_ := strconv.Atoi(*port)
 		serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: []byte{0, 0, 0, 0}, Port: PORT, Zone: ""})
 		buf := make([]byte, 1024)
@@ -363,29 +371,27 @@ func main() {
 		//establish connection to  MX over gRPC channel
 		connectJET(*jip + ":" + *jport, *juser, *jpass)
 
-		//program default accept term to fail over to cli filter for unmatched packets. Pass filtername name
-		programDefaultTerm("FLOW_OFFLOAD")
-
+		//program default accept term to fail over to cli filter for unmatched packets.
+		programDefaultTerm(SERVICE_FILTER)
+		programDefaultTerm(SERVICE_FILTER_REVERSE)
 		//receive data from udp socket 
 		for {
 			data, _, _ := serverConn.ReadFromUDP(buf)
 			bufdata := string(buf[0:data])
 			vals, sessType := parseFlow(bufdata)
-			fmt.Println(vals, sessType)
 			if strings.Compare(sessType, SESS_CREATE) == 0 {
 				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
 				hflow := HashString(flow)
 				sessTable[hflow] = vals
 				go programFlow(hflow)
-				fmt.Println(time.Now(), "added flowinfo to session table\n")
+				log.Println(time.Now(), "added flowinfo to session table\n")
 
 			} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
-				fmt.Println("deleting flow...")
 				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
 				hflow := HashString(flow)
 				time.Now()
 				delete(sessTable, hflow)
-				fmt.Println(time.Now(),"Received either session close due to session close msg or due to session time out from vSRX. Deleted flowinfo from session table\n")
+				log.Println(time.Now(),"Received either session close due to session close msg or due to session time out from vSRX. Deleted flowinfo from session table\n")
 			}
 		}
 	}
