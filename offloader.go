@@ -3,7 +3,7 @@ Author: Aravind Prabhakar
 Version: v1.0
 Description: Flow offloader on a service chained topology. This app
 will listen to syslog session Inits and closes from vSRX and offload the
-flow on to MX
+flow on to MX.
 */
 
 package main
@@ -14,7 +14,6 @@ import (
 	auth "jnx/jet/auth"
 	jnx "jnx/jet/common"
 	fw "jnx/jet/firewall"
-	"net"
 	"strings"
 	"time"
 	"log"
@@ -27,19 +26,32 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 	"golang.org/x/crypto/ssh/terminal"
-
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/pcap"
+	"github.com/google/gopacket/layers"
+	"encoding/hex"
 )
 
 const (
 	TYPE            = "udp"         //protocol type
 	SESS_CREATE     = "RT_FLOW_SESSION_CREATE"
 	SESS_CLOSE      = "RT_FLOW_SESSION_CLOSE"
-	VALID_SESS_TIME = 30
+	VALID_SESS_TIME = 30 //seconds
+	VALID_FILTER_TIME = 120 //seconds
 	TIMEOUT         = 30
 	INDEX           = 0
 	ROUTE_TABLE	= "SERVICE.inet.0"
 	SERVICE_FILTER	= "FLOW_OFFLOAD"
 	SERVICE_FILTER_REVERSE	= "FLOW_OFFLOAD_REVERSE"
+)
+
+var (
+	device      string = "jet"
+	snapshotLen int32  = 1024
+	promiscuous bool   = false
+	err         error
+	timeout     time.Duration = 30 * time.Second
+	handle      *pcap.Handle
 )
 
 // session values which would be stored in maps
@@ -93,6 +105,7 @@ func connectJET(addr string, juser string, jpass string) error {
 	return nil
 }
 
+
 // remove UTF-8 character
 func RemoveLastChar(str string) string {
 	for len(str) > 0 {
@@ -101,6 +114,7 @@ func RemoveLastChar(str string) string {
 	}
 	return str
 }
+
 
 func RemoveFirstChar(s string) string {
 	_, i := utf8.DecodeRuneInString(s)
@@ -115,6 +129,257 @@ func HashString(str string) string {
 	s := strconv.FormatUint(uint64(h.Sum32()),10)
 	return s
 }
+
+
+// Decode bytes and return a dotted val of IP address
+func Ipv4Decode(input []byte) string {
+	var val [4]string
+	for i:=0;i<len(input);i++ {
+		hexval := hex.EncodeToString(input[i:i+1])
+		dval,_ := strconv.ParseInt(hexval, 16, 64)
+		val[i] = strconv.FormatInt(dval,10)
+	}
+	return val[0]+"."+val[1]+"."+val[2]+"."+val[3]
+}
+
+// Decode port bytes and return an int64 value
+func PortDecode(input []byte) int64 {
+	hexval := hex.EncodeToString(input)
+	dval,_ := strconv.ParseInt(hexval, 16, 64)
+	return dval
+}
+
+type IpfixTempData struct {
+	Timestamp string
+	ObservationId string
+	Version string
+	FlowsetId string
+	Flowlen string
+	Length string
+	TemplateId string
+	Flowseq string
+}
+
+// IPFIX Template definition
+type IpfixFlowData struct {
+	IpSrcAddr string
+	IpDstAddr string
+	Protocol int64
+	L4SrcPort int64
+	L4DstPort int64
+	//IpTos uint8
+	//IcmpType uint8
+	//InputSnmp string
+	//SrcVlan uint16
+	//SrcMask uint8
+	//DstMask uint8
+	//SrcAs uint16
+	//DstAs uint16
+	//IpNextHop []byte
+	//TcpFlags uint8
+	//OutputSnmp string
+	//TtlMin uint8
+	//TtlMax uint8
+	//FlowEndReason uint8
+	//IpProtoVersion uint8
+	//BgpNextHop uint32
+	//Direction uint8
+	//Dot1qvlanId uint16
+	//Dot1qCustVlanId uint16
+	//Ipv4Id uint32
+	//Bytes uint64
+	//Pkts uint16
+	//FlowStartMilliSeconds uint16
+	//FlowEndMilliSeconds uint16
+}
+
+
+var sessionVals sessionValues
+
+// Map to store {flow1: (sip,dip,sport, dport, protocol, time), flow2:(), flow3:().....}
+var sessTable = make(map[string]sessionValues)
+
+// Parse the flow to grab 5 tuple information
+func decodeSyslog(buffer string) (sessionValues, string) {
+	datasplit := strings.Split(buffer, " ")
+	sessType := strings.TrimRight(datasplit[5], " ")
+	if strings.Compare(sessType, SESS_CREATE) == 0 {
+		//fmt.Println("session create received")
+		sessionVals.session_time = datasplit[1]
+		for i := 7; i <= 10; i++ {
+			val := strings.Split(datasplit[i], "=")
+			switch val[0] {
+			case "source-address":
+				sessionVals.source_ip = RemoveFirstChar(RemoveLastChar(val[1]))
+			case "source-port":
+				sessionVals.source_port = RemoveFirstChar(RemoveLastChar(val[1]))
+			case "destination-address":
+				sessionVals.dest_ip = RemoveFirstChar(RemoveLastChar(val[1]))
+			case "destination-port":
+				sessionVals.dest_port = RemoveFirstChar(RemoveLastChar(val[1]))
+			}
+		}
+	} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
+		//fmt.Println("session close received..")
+		sessionVals.session_time = datasplit[1]
+		for i := 7; i <= 10; i++ {
+			val := strings.Split(datasplit[i], "=")
+			switch val[0] {
+			case "source-address":
+				sessionVals.source_ip = RemoveFirstChar(RemoveLastChar(val[1]))
+			case "source-port":
+				sessionVals.source_port = RemoveFirstChar(RemoveLastChar(val[1]))
+			case "destination-address":
+				sessionVals.dest_ip = RemoveFirstChar(RemoveLastChar(val[1]))
+			case "destination-port":
+				sessionVals.dest_port = RemoveFirstChar(RemoveLastChar(val[1]))
+			}
+		}
+	}
+	return sessionVals, sessType
+}
+
+// Template information to store
+var temp IpfixTempData
+
+func decodeIpfix(payload []byte) string {
+	var iflow IpfixFlowData
+	iFixVersion := payload[0:2]
+	if hex.EncodeToString(iFixVersion) == "000a" {
+		fmt.Println("Decoding IPFIX packet...")
+		iFixFlowSetId := hex.EncodeToString(payload[16:18])
+		if iFixFlowSetId == "0002" {
+			//template packets would be 0002
+			fmt.Println("Template packet received \n")
+			temp.Version = hex.EncodeToString(iFixVersion)
+			temp.Length = hex.EncodeToString(payload[2:4])
+			temp.Timestamp = hex.EncodeToString(payload[4:8])
+			temp.Flowseq = hex.EncodeToString(payload[8:12])
+			temp.ObservationId = hex.EncodeToString(payload[12:16])
+			temp.FlowsetId = hex.EncodeToString(payload[16:18])
+			temp.Flowlen = hex.EncodeToString(payload[18:20])
+			temp.TemplateId = hex.EncodeToString(payload[20:22])
+		} else {
+			if iFixFlowSetId == temp.TemplateId {
+				fmt.Println("Decoding flowdata packet \n")
+				//flowsetLen = hex.EncodeToString(payload[18:20])
+				//flow.IpSrcAddr = hex.EncodeToString(payload[20:24])
+				iflow.IpSrcAddr = Ipv4Decode(payload[20:24])
+				iflow.IpDstAddr = Ipv4Decode(payload[24:28])
+				iflow.Protocol = PortDecode(payload[29:30])
+				iflow.L4SrcPort = PortDecode(payload[30:32])
+				iflow.L4DstPort = PortDecode(payload[32:34])
+				fmt.Println("Flow entry: ",iflow)
+			} else {
+				fmt.Println("Unable to decode IPfix packet \n")
+			}
+		}
+	} else {
+		fmt.Println("Not an IPFIX packet, skipping decoding.. \n")
+	}
+	return iflow.IpSrcAddr + iflow.IpDstAddr + strconv.Itoa(int(iflow.L4SrcPort)) + strconv.Itoa(int(iflow.L4DstPort))
+}
+
+// Map to store {flow1: (sip,dip,sport, dport, protocol, time), flow2:(), flow3:().....}
+var offloadTable = make(map[string]sessionValues)
+//validate flow and offload based on session time threshold
+
+func programFlow(hflow string) {
+	time.Sleep(VALID_SESS_TIME * time.Second)
+	val, ok := sessTable[hflow]
+	if ok {
+		log.Println(time.Now(),"valid session time elapsed and flow is still active. adding redirection on MX\n")
+		offloadTable[hflow] = val
+		addFlow(SERVICE_FILTER, hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
+		addFlow(SERVICE_FILTER_REVERSE, hflow, val.dest_ip, val.source_ip, val.dest_port, val.source_port)
+		log.Println("added entry to offload table")
+	} else {
+		log.Println("flow doesnt exist. skip programming.. \n")
+	}
+}
+
+
+func decodePacket(packet gopacket.Packet) {
+	// Flow information to store
+	/*
+	// Outer Ethernet layer
+	ethLayer := packet.Layer(layers.LayerTypeEthernet)
+	if ethLayer != nil {
+		fmt.Println("========= Ethernet layer ======= \n")
+		ethPacket,_ := ethLayer.(*layers.Ethernet)
+		fmt.Println("Source Mac: ", ethPacket.SrcMAC)
+		fmt.Println("Dest Mac: ", ethPacket.DstMAC)
+		fmt.Println("Eth Type: ", ethPacket.EthernetType)
+	}
+
+	// Outer Iplayer 
+	ipLayer := packet.Layer(layers.LayerTypeIPv4)
+	if ipLayer != nil {
+		fmt.Println("========== IP Layer ========== \n")
+		ipPacket,_ := ipLayer.(*layers.IPv4)
+		fmt.Println("Source IP: ", ipPacket.SrcIP)
+		fmt.Println("Dest IP: ", ipPacket.DstIP)
+		fmt.Println("Protocol: ", ipPacket.Protocol)
+	}*/
+
+	//Outer UdpLayer
+	udpLayer := packet.Layer(layers.LayerTypeUDP)
+	var uDestPort layers.UDPPort
+	if udpLayer != nil {
+		fmt.Println("========= UDP Layer ============ \n")
+		udp,_ := udpLayer.(*layers.UDP)
+		fmt.Println("Source Port: ", udp.SrcPort)
+		fmt.Println("Dest Port: ", udp.DstPort)
+		fmt.Println("UDP Length: ", udp.Length)
+		uDestPort = udp.DstPort
+	}
+	if uDestPort == 514 {
+		fmt.Println("syslog packet")
+		log.Println("received syslog packet....")
+		appLayer := packet.ApplicationLayer()
+		if appLayer != nil {
+			payload := appLayer.Payload()
+			// syslog string occurs 42B after UDP payload
+			syslogString := string(payload)
+			fmt.Println(syslogString)
+			vals, sessType := decodeSyslog(syslogString)
+			if strings.Compare(sessType, SESS_CREATE) == 0 {
+				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
+				hflow := HashString(flow)
+				sessTable[hflow] = vals
+				go programFlow(hflow)
+				log.Println(time.Now(), "added flowinfo to session table\n")
+
+			} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
+				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
+				hflow := HashString(flow)
+				time.Now()
+				delete(sessTable, hflow)
+				log.Println(time.Now(),"Received either session close due to session close msg or due to session time out from vSRX. Deleted flowinfo from session table\n")
+			}
+		}
+
+	} else if uDestPort == 45000 {
+		fmt.Println("ipfix packet")
+		//IPfix Layer (payload) decoding
+		//payload decoded as applicationLayer
+		appLayer := packet.ApplicationLayer()
+		if appLayer != nil {
+			payload := appLayer.Payload()
+			flow := decodeIpfix(payload)
+			hflow := HashString(flow)
+			// check if flow exists in offload table 
+			val, ok := offloadTable[hflow]
+			if ok {
+				fmt.Println("Flow exists in offload table.. retain it", val)
+			} else {
+				fmt.Println("Flow does not exist in offload table..", val)
+			}
+
+		}
+	}
+}
+
 
 
 // program default accept term so that it can fall back to cli filter
@@ -271,69 +536,8 @@ func addFlow(filtername string, name string, src_ip string, dst_ip string, src_p
 	}
 }*/
 
-var sessionVals sessionValues
-
-// Map to store {flow1: (sip,dip,sport, dport, protocol, time), flow2:(), flow3:().....}
-var sessTable = make(map[string]sessionValues)
-
-// Parse the flow to grab 5 tuple information
-func parseFlow(buffer string) (sessionValues, string) {
-	datasplit := strings.Split(buffer, " ")
-	sessType := strings.TrimRight(datasplit[5], " ")
-	if strings.Compare(sessType, SESS_CREATE) == 0 {
-		//fmt.Println("session create received")
-		sessionVals.session_time = datasplit[1]
-		for i := 7; i <= 10; i++ {
-			val := strings.Split(datasplit[i], "=")
-			switch val[0] {
-			case "source-address":
-				sessionVals.source_ip = RemoveFirstChar(RemoveLastChar(val[1]))
-			case "source-port":
-				sessionVals.source_port = RemoveFirstChar(RemoveLastChar(val[1]))
-			case "destination-address":
-				sessionVals.dest_ip = RemoveFirstChar(RemoveLastChar(val[1]))
-			case "destination-port":
-				sessionVals.dest_port = RemoveFirstChar(RemoveLastChar(val[1]))
-			}
-		}
-	} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
-		//fmt.Println("session close received..")
-		sessionVals.session_time = datasplit[1]
-		for i := 7; i <= 10; i++ {
-			val := strings.Split(datasplit[i], "=")
-			switch val[0] {
-			case "source-address":
-				sessionVals.source_ip = RemoveFirstChar(RemoveLastChar(val[1]))
-			case "source-port":
-				sessionVals.source_port = RemoveFirstChar(RemoveLastChar(val[1]))
-			case "destination-address":
-				sessionVals.dest_ip = RemoveFirstChar(RemoveLastChar(val[1]))
-			case "destination-port":
-				sessionVals.dest_port = RemoveFirstChar(RemoveLastChar(val[1]))
-			}
-		}
-	}
-	return sessionVals, sessType
-}
 
 
-// Map to store {flow1: (sip,dip,sport, dport, protocol, time), flow2:(), flow3:().....}
-var offloadTable = make(map[string]sessionValues)
-//validate flow and offload based on session time threshold
-
-func programFlow(hflow string) {
-	time.Sleep(VALID_SESS_TIME * time.Second)
-	val, ok := sessTable[hflow]
-	if ok {
-		log.Println(time.Now(),"valid session time elapsed and flow is still active. adding redirection on MX\n")
-		offloadTable[hflow] = val
-		addFlow(SERVICE_FILTER, hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
-		addFlow(SERVICE_FILTER_REVERSE, hflow, val.dest_ip, val.source_ip, val.dest_port, val.source_port)
-		log.Println("added entry to offload table")
-	} else {
-		log.Println("flow doesnt exist. skip programming.. \n")
-	}
-}
 
 func main() {
 	logs, logerr := os.OpenFile("offloader.log", os.O_RDWR | os.O_CREATE | os.O_APPEND, 0666)
@@ -345,7 +549,7 @@ func main() {
 
 	parser := argparse.NewParser("Required-args", "\n============\ntraffic-offloader\n============")
 	log.Println("connected to host ...")
-	port := parser.String("p", "port", &argparse.Options{Required: true, Help: "Port number to bind app to"})
+	//port := parser.String("p", "port", &argparse.Options{Required: true, Help: "Port number to bind app to"})
 	jip := parser.String("J", "jetip", &argparse.Options{Required: true, Help: "Jet host IP "})
 	jport := parser.String("P", "jetport", &argparse.Options{Required: true, Help: "Jet host port"})
 	juser := parser.String("u", "user", &argparse.Options{Required: true, Help: "user name for jet host"})
@@ -363,36 +567,20 @@ func main() {
 			*jpass = string(bytePassword)
 		}
 
-
-		PORT,_ := strconv.Atoi(*port)
-		serverConn, _ := net.ListenUDP("udp", &net.UDPAddr{IP: []byte{0, 0, 0, 0}, Port: PORT, Zone: ""})
-		buf := make([]byte, 1024)
-
 		//establish connection to  MX over gRPC channel
 		connectJET(*jip + ":" + *jport, *juser, *jpass)
 
 		//program default accept term to fail over to cli filter for unmatched packets.
 		programDefaultTerm(SERVICE_FILTER)
 		programDefaultTerm(SERVICE_FILTER_REVERSE)
-		//receive data from udp socket 
-		for {
-			data, _, _ := serverConn.ReadFromUDP(buf)
-			bufdata := string(buf[0:data])
-			vals, sessType := parseFlow(bufdata)
-			if strings.Compare(sessType, SESS_CREATE) == 0 {
-				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
-				hflow := HashString(flow)
-				sessTable[hflow] = vals
-				go programFlow(hflow)
-				log.Println(time.Now(), "added flowinfo to session table\n")
-
-			} else if strings.Compare(sessType, SESS_CLOSE) == 0 {
-				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
-				hflow := HashString(flow)
-				time.Now()
-				delete(sessTable, hflow)
-				log.Println(time.Now(),"Received either session close due to session close msg or due to session time out from vSRX. Deleted flowinfo from session table\n")
-			}
+		// handle packets
+		handle, err = pcap.OpenLive(device, snapshotLen, promiscuous, timeout)
+		if err != nil {log.Fatal(err) }
+		defer handle.Close()
+		packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
+		for packet := range packetSource.Packets() {
+			decodePacket(packet)
 		}
+
 	}
 }
