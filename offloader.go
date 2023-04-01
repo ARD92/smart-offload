@@ -40,7 +40,8 @@ const (
 	VALID_FILTER_TIME = 120 //seconds
 	TIMEOUT         = 30
 	INDEX           = 0
-	ROUTE_TABLE	= "SERVICE.inet.0"
+	ROUTE_TABLE	= "TEST-CUSTOMER-VRF.inet.0" // userconfig for customer vrf
+	INTERFACE_NAME	= "ge-0/0/5.0" //user config for reverse filter
 	SERVICE_FILTER	= "FLOW_OFFLOAD"
 	SERVICE_FILTER_REVERSE	= "FLOW_OFFLOAD_REVERSE"
 )
@@ -421,6 +422,43 @@ func programDefaultTerm(filtername string) {
 	}
 }
 
+// Filter binding . Currently only IPv4 supported
+func filterBind(filtername string, bindtype string, bindval string){
+	var bindreq *fw.FilterObjBindAddRequest
+	if bindtype == "interface" {
+		bindreq = &fw.FilterObjBindAddRequest {
+			Filter: &fw.Filter {Name: filtername, Family:fw.FilterFamilies_FAMILY_INET},
+			ObjType: fw.FilterBindObjType_BIND_OBJ_TYPE_INTERFACE,
+			BindObject: &fw.FilterBindObjPoint {
+				BindPoint: &fw.FilterBindObjPoint_InterfaceName {
+					InterfaceName: bindval,
+				},
+			},
+			BindDirection: fw.FilterBindDirection_BIND_DIRECTION_INPUT,
+			BindFamily: fw.FilterFamilies_FAMILY_INET,
+		}
+	} else if bindtype == "fwdtable" {
+		bindreq = &fw.FilterObjBindAddRequest {
+			Filter: &fw.Filter {Name: filtername, Family:fw.FilterFamilies_FAMILY_INET},
+			ObjType: fw.FilterBindObjType_BIND_OBJ_TYPE_FWD_TABLE,
+			BindObject: &fw.FilterBindObjPoint {
+				BindPoint: &fw.FilterBindObjPoint_ForwardingTable {
+					ForwardingTable: bindval,
+				},
+			},
+			BindDirection: fw.FilterBindDirection_BIND_DIRECTION_INPUT,
+			BindFamily: fw.FilterFamilies_FAMILY_INET,
+		}
+	}
+	resp, err := junos.cliClient.FilterBindAdd(junos.cliContext, bindreq)
+	if err != nil {
+		log.Println("Failed to bind filter\n")
+	} else if resp.Status.Code != jnx.StatusCode_SUCCESS {
+		log.Println("failed to bind filter to routing instance or interface\n")
+	} else {
+		log.Println("Successfully bound filter to routing-instance or interface\n")
+	}
+}
 
 // program flow to MX as JET filter
 func addFlow(filtername string, name string, src_ip string, dst_ip string, src_port string, dst_port string) {
@@ -473,7 +511,7 @@ func addFlow(filtername string, name string, src_ip string, dst_ip string, src_p
 	}
 	cntName := "COUNT-"+name
 	Action := &fw.FilterTermInetAction {
-		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}},
+		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}, Sample: true},
 		ActionT: &fw.FilterTermInetTerminatingAction {TerminatingAction: &fw.FilterTermInetTerminatingAction_Accept {Accept: true}},
 	}
 	Adj := &fw.FilterAdjacency { Type: fw.FilterAdjacencyType_TERM_AFTER, TermName: "JET-ACCEPT-ALL" } // JET-ACCEPT-ALL will be placed after definining term
@@ -573,6 +611,8 @@ func main() {
 		//program default accept term to fail over to cli filter for unmatched packets.
 		programDefaultTerm(SERVICE_FILTER)
 		programDefaultTerm(SERVICE_FILTER_REVERSE)
+		filterBind(SERVICE_FILTER,"fwdtable", ROUTE_TABLE )
+		filterBind(SERVICE_FILTER_REVERSE, "interface", INTERFACE_NAME)
 		// handle packets
 		handle, err = pcap.OpenLive(device, snapshotLen, promiscuous, timeout)
 		if err != nil {log.Fatal(err) }
