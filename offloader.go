@@ -4,6 +4,8 @@ Version: v1.0
 Description: Flow offloader on a service chained topology. This app
 will listen to syslog session Inits and closes from vSRX and offload the
 flow on to MX.
+SYSLOG port 514
+Ipfix port 45000
 */
 
 package main
@@ -244,6 +246,7 @@ func decodeSyslog(buffer string) (sessionValues, string) {
 var temp IpfixTempData
 
 func decodeIpfix(payload []byte) string {
+	var ret string
 	var iflow IpfixFlowData
 	iFixVersion := payload[0:2]
 	if hex.EncodeToString(iFixVersion) == "000a" {
@@ -260,6 +263,7 @@ func decodeIpfix(payload []byte) string {
 			temp.FlowsetId = hex.EncodeToString(payload[16:18])
 			temp.Flowlen = hex.EncodeToString(payload[18:20])
 			temp.TemplateId = hex.EncodeToString(payload[20:22])
+			ret = "TEMPLATE"
 		} else {
 			if iFixFlowSetId == temp.TemplateId {
 				fmt.Println("Decoding flowdata packet \n")
@@ -271,14 +275,19 @@ func decodeIpfix(payload []byte) string {
 				iflow.L4SrcPort = PortDecode(payload[30:32])
 				iflow.L4DstPort = PortDecode(payload[32:34])
 				fmt.Println("Flow entry: ",iflow)
+				ret = iflow.IpSrcAddr + iflow.IpDstAddr + strconv.Itoa(int(iflow.L4SrcPort)) + strconv.Itoa(int(iflow.L4DstPort))
 			} else {
 				fmt.Println("Unable to decode IPfix packet \n")
+				log.Println("Unable to decode IPfix packet \n")
+				ret = "ERROR"
 			}
 		}
 	} else {
+		ret = "Error"
 		fmt.Println("Not an IPFIX packet, skipping decoding.. \n")
+		log.Println("Not an IPFIX packet, skipping decoding.. \n")
 	}
-	return iflow.IpSrcAddr + iflow.IpDstAddr + strconv.Itoa(int(iflow.L4SrcPort)) + strconv.Itoa(int(iflow.L4DstPort))
+	return ret
 }
 
 // Map to store {flow1: (sip,dip,sport, dport, protocol, time), flow2:(), flow3:().....}
@@ -286,14 +295,24 @@ var offloadTable = make(map[string]sessionValues)
 //validate flow and offload based on session time threshold
 
 func programFlow(hflow string) {
+	var flowrev sessionValues
 	time.Sleep(VALID_SESS_TIME * time.Second)
 	val, ok := sessTable[hflow]
 	if ok {
 		log.Println(time.Now(),"valid session time elapsed and flow is still active. adding redirection on MX\n")
+		// create reverse flow entry
+		flowrev.source_ip = val.dest_ip
+		flowrev.dest_ip = val.source_ip
+		flowrev.source_port = val.dest_port
+		flowrev.dest_port = val.source_port
+
+		hflowrev := HashString(flowrev.source_ip+flowrev.dest_ip+flowrev.source_port+flowrev.dest_port)
 		offloadTable[hflow] = val
-		addFlow(SERVICE_FILTER, hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
-		addFlow(SERVICE_FILTER_REVERSE, hflow, val.dest_ip, val.source_ip, val.dest_port, val.source_port)
+		offloadTable[hflowrev] = flowrev
 		log.Println("added entry to offload table")
+		log.Println(offloadTable)
+		addFlow(SERVICE_FILTER, hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
+		addFlow(SERVICE_FILTER_REVERSE, hflowrev, flowrev.source_ip, flowrev.dest_ip, flowrev.source_port, flowrev.dest_port)
 	} else {
 		log.Println("flow doesnt exist. skip programming.. \n")
 	}
@@ -342,11 +361,12 @@ func decodePacket(packet gopacket.Packet) {
 			payload := appLayer.Payload()
 			// syslog string occurs 42B after UDP payload
 			syslogString := string(payload)
-			fmt.Println(syslogString)
+			log.Println(syslogString)
 			vals, sessType := decodeSyslog(syslogString)
 			if strings.Compare(sessType, SESS_CREATE) == 0 {
 				flow := vals.source_ip + vals.dest_ip + vals.source_port + vals.dest_port
 				hflow := HashString(flow)
+				fmt.Println("syslog: ", flow, hflow)
 				sessTable[hflow] = vals
 				go programFlow(hflow)
 				log.Println(time.Now(), "added flowinfo to session table\n")
@@ -368,15 +388,20 @@ func decodePacket(packet gopacket.Packet) {
 		if appLayer != nil {
 			payload := appLayer.Payload()
 			flow := decodeIpfix(payload)
-			hflow := HashString(flow)
-			// check if flow exists in offload table 
-			val, ok := offloadTable[hflow]
-			if ok {
-				fmt.Println("Flow exists in offload table.. retain it", val)
-			} else {
-				fmt.Println("Flow does not exist in offload table..", val)
+			fmt.Println(flow)
+			if (flow != "ERROR") && (flow != "TEMPLATE") {
+				hflow := HashString(flow)
+				fmt.Println("ipfix:", flow, hflow)
+				// check if flow exists in offload table 
+				val, ok := offloadTable[hflow]
+				if ok {
+					fmt.Println("Flow exists in offload table.. retain it", val)
+					log.Println("Flow exists in offload table.. retain it", val)
+				} else {
+					fmt.Println("Flow does not exist in offload table..", val)
+					log.Println("Flow does not exist in offload table..", val)
+				}
 			}
-
 		}
 	}
 }
