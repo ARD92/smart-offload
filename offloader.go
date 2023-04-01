@@ -42,7 +42,7 @@ const (
 	VALID_FILTER_TIME = 120 //seconds
 	TIMEOUT         = 30
 	INDEX           = 0
-	ROUTE_TABLE	= "TEST-CUSTOMER-VRF.inet.0" // userconfig for customer vrf
+	ROUTE_TABLE	= "TEST-CUSTOMER-VRF" // userconfig for customer vrf
 	INTERFACE_NAME	= "ge-0/0/5.0" //user config for reverse filter
 	SERVICE_FILTER	= "FLOW_OFFLOAD"
 	SERVICE_FILTER_REVERSE	= "FLOW_OFFLOAD_REVERSE"
@@ -409,8 +409,8 @@ func decodePacket(packet gopacket.Packet) {
 
 
 // program default accept term so that it can fall back to cli filter
-func programDefaultTerm(filtername string) {
-	cntName := "COUNT-JET-ACCEPT-ALL"
+func programDefaultTerm(filtername string, countername string) {
+	cntName := countername
 	Action := &fw.FilterTermInetAction {
 		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}},
 		ActionT: &fw.FilterTermInetTerminatingAction {TerminatingAction: &fw.FilterTermInetTerminatingAction_Accept {Accept: true}},
@@ -573,19 +573,23 @@ func addFlow(filtername string, name string, src_ip string, dst_ip string, src_p
 }
 
 // delete flow on MX from JET filters
-/*func delFlow(name string) {
+func delFlow(filter string, name string) {
 	var filterTermSlice []*fw.FilterTerm
-	filterTerm := &fw.FilterInetTerm {
-		TermName: "OFFLOAD_"+name,
-		TermOp: 2 // term delete,
+	filterTerm := &fw.FilterTerm {
+		FilterTerm: &fw.FilterTerm_InetTerm {
+			InetTerm: &fw.FilterInetTerm {
+				TermName: "OFFLOAD_"+name,
+				TermOp: fw.FilterTermOperation_TERM_OPERATION_DELETE,
+			},
+		},
 	}
 	filterTermSlice = append(filterTermSlice, filterTerm)
 	// Filter family type : 1 (Ipv4), 2(IPv6)
 	// Filter type: 1(Classic), 0 (Invalid)
-	output := &mgmt.FilterModifyRequest{
-		Name: "FLOW_OFFLOAD",
-		Types: 1,
-		Family: 1,
+	output := &fw.FilterModifyRequest{
+		Name: filter,
+		Type: fw.FilterTypes_TYPE_CLASSIC,
+		Family: fw.FilterFamilies_FAMILY_INET,
 		TermsList: filterTermSlice,
 	}
 	fmt.Println(output)
@@ -597,9 +601,7 @@ func addFlow(filtername string, name string, src_ip string, dst_ip string, src_p
 	} else {
 		fmt.Println("successfully deleted the flow", resp)
 	}
-}*/
-
-
+}
 
 
 func main() {
@@ -634,8 +636,8 @@ func main() {
 		connectJET(*jip + ":" + *jport, *juser, *jpass)
 
 		//program default accept term to fail over to cli filter for unmatched packets.
-		programDefaultTerm(SERVICE_FILTER)
-		programDefaultTerm(SERVICE_FILTER_REVERSE)
+		programDefaultTerm(SERVICE_FILTER, "COUNT-JET-ACCEPT-ALL")
+		programDefaultTerm(SERVICE_FILTER_REVERSE, "COUNT-REV-JET-ACCEPT-ALL")
 		filterBind(SERVICE_FILTER,"fwdtable", ROUTE_TABLE )
 		filterBind(SERVICE_FILTER_REVERSE, "interface", INTERFACE_NAME)
 		// handle packets
