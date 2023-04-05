@@ -46,6 +46,8 @@ const (
 	INTERFACE_NAME	= "ge-0/0/5.0" //user config for reverse filter
 	SERVICE_FILTER	= "FLOW_OFFLOAD"
 	SERVICE_FILTER_REVERSE	= "FLOW_OFFLOAD_REVERSE"
+	OFFLOAD_REDIRECT_INSTANCE = "OFFLOAD-FORWARD" // redirect instance needs to be configured
+	OFFLOAD_REVERSE_REDIRECT_INSTANCE = "OFFLOAD-REVERSE" //redirect instance needs to be configured
 )
 
 var (
@@ -196,6 +198,15 @@ type IpfixFlowData struct {
 	//FlowEndMilliSeconds uint16
 }
 
+// map to store keep alives.
+//set true if receiving
+// set false if not received for > threshold timer
+
+var keepAlive = make(map[string]bool)
+func handleKeepAlive(keepAlive map[string]bool) {
+	// clear dead filters 
+	fmt.Println("clearing dead flows\n")
+}
 
 var sessionVals sessionValues
 
@@ -244,7 +255,6 @@ func decodeSyslog(buffer string) (sessionValues, string) {
 
 // Template information to store
 var temp IpfixTempData
-
 func decodeIpfix(payload []byte) string {
 	var ret string
 	var iflow IpfixFlowData
@@ -311,8 +321,11 @@ func programFlow(hflow string) {
 		offloadTable[hflowrev] = flowrev
 		log.Println("added entry to offload table")
 		log.Println(offloadTable)
-		addFlow(SERVICE_FILTER, hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port)
-		addFlow(SERVICE_FILTER_REVERSE, hflowrev, flowrev.source_ip, flowrev.dest_ip, flowrev.source_port, flowrev.dest_port)
+		addFlow(SERVICE_FILTER, hflow, val.source_ip, val.dest_ip, val.source_port, val.dest_port, OFFLOAD_REDIRECT_INSTANCE)
+		addFlow(SERVICE_FILTER_REVERSE, hflowrev, flowrev.source_ip, flowrev.dest_ip, flowrev.source_port, flowrev.dest_port, OFFLOAD_REVERSE_REDIRECT_INSTANCE)
+		// mark for keep alive
+		keepAlive[hflow]=true
+		keepAlive[hflowrev]=true
 	} else {
 		log.Println("flow doesnt exist. skip programming.. \n")
 	}
@@ -486,7 +499,7 @@ func filterBind(filtername string, bindtype string, bindval string){
 }
 
 // program flow to MX as JET filter
-func addFlow(filtername string, name string, src_ip string, dst_ip string, src_port string, dst_port string) {
+func addFlow(filtername string, name string, src_ip string, dst_ip string, src_port string, dst_port string, ri_name string) {
 	idstport,_ := strconv.Atoi(dst_port)
 	isrcport,_ := strconv.Atoi(src_port)
 	udstport := uint32(idstport)
@@ -537,7 +550,8 @@ func addFlow(filtername string, name string, src_ip string, dst_ip string, src_p
 	cntName := "COUNT-"+name
 	Action := &fw.FilterTermInetAction {
 		ActionsNt: &fw.FilterTermInetNonTerminatingAction {Count: &fw.ActionCounter {CounterName: cntName}, Sample: true},
-		ActionT: &fw.FilterTermInetTerminatingAction {TerminatingAction: &fw.FilterTermInetTerminatingAction_Accept {Accept: true}},
+		//ActionT: &fw.FilterTermInetTerminatingAction {TerminatingAction: &fw.FilterTermInetTerminatingAction_Accept {Accept: true}},
+		ActionT: &fw.FilterTermInetTerminatingAction {TerminatingAction: &fw.FilterTermInetTerminatingAction_RoutingInstanceName{RoutingInstanceName: ri_name}},
 	}
 	Adj := &fw.FilterAdjacency { Type: fw.FilterAdjacencyType_TERM_AFTER, TermName: "JET-ACCEPT-ALL" } // JET-ACCEPT-ALL will be placed after definining term
 	var filterTermSlice []*fw.FilterTerm
@@ -641,13 +655,13 @@ func main() {
 		filterBind(SERVICE_FILTER,"fwdtable", ROUTE_TABLE )
 		filterBind(SERVICE_FILTER_REVERSE, "interface", INTERFACE_NAME)
 		// handle packets
+		//go handleKeepAlive(keepAlive)
 		handle, err = pcap.OpenLive(device, snapshotLen, promiscuous, timeout)
 		if err != nil {log.Fatal(err) }
 		defer handle.Close()
 		packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 		for packet := range packetSource.Packets() {
-			decodePacket(packet)
+			go decodePacket(packet)
 		}
-
 	}
 }
