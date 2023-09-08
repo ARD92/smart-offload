@@ -1,0 +1,112 @@
+/*
+This is a custom yang for flow offload.
+*/
+
+module offload {
+    namespace "http://offloader";
+    prefix "offloader"
+    import junos-extension {
+        prefix junos;
+    }
+    import junos-common-odl-extensions {
+        prefix junos-odl;
+    }
+
+    organization "Juniper Networks";
+
+    contact "aprabh@juniper.net";
+
+    description "Yang model for showing offloaded flow stats";
+
+    revision "2023-09-08" {
+        description "Version 1.0";
+    }
+    
+    rpc get-offload {
+        description "list all the sessions that was offloaded";
+        junos:command "show offload" {
+            junos:action-execute {
+                junos:script "offload_action.py";
+            }
+        }
+
+        input {
+            leaf statistics {
+                type empty;
+            }
+            leaf detail {
+                type empty;
+            }
+        } 
+
+        output {
+            container session {
+                leaf name {
+                    description "session name";
+                    type string;
+                }
+                leaf packets {
+                    descriptions "packets offloaded";
+                    type int;
+                }
+                container flow {
+                    leaf src-ip {
+                        description "Source IP";
+                        type string;
+                    }
+                    leaf dst-ip {
+                        description "Destination IP";
+                        type int;
+                    }
+                    leaf src-port {
+                        description "Source port";
+                        type int;
+                    }
+                    leaf dst-port {
+                        description "Dest port";
+                        type string;
+                    }
+                    leaf proto {
+                        description "Protocol";
+                        type string;
+                    }
+                    junos-odl:format flow-format {
+                    junos-odl:picture '
+                    src-ip : @<<<<<<<
+                    dst-ip : @<<<<<<
+                    src-port : @<<<<<<
+                    dst-port : @<<<<<<
+                    proto : @<<<<<`;
+                        junos-odl:line {
+                            junos-odl:field "src-ip";
+                        }
+                        junos-odl:line {
+                            junos-odl:field "dst-ip";
+                        }
+                        junos-odl:line {
+                            junos-odl:field "src-port";
+                        }
+                        junos-odl:line {
+                            junos-odl:field "dst-port";
+                        }
+                        junos-odl:line {
+                            junos-odl:field "proto";
+                        }
+                        junos-odl:blank-line;
+                    }   
+                }
+                junos-odl:format session-format {
+                junos-odl:picture '
+                name : @<<<
+                packets: @<<<`;
+                    junos-odl:line {
+                        junos-odl:field "name";
+                    }
+                    junos-odl:line {
+                        junos-odl:field "packets";
+                    }
+                    junos-odl:blank-line;
+                }   
+        }
+}
+
